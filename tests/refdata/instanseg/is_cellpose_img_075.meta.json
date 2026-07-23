@@ -1,0 +1,16 @@
+{
+ "name": "cellpose_img_075",
+ "H": 300,
+ "W": 240,
+ "Hp": 304,
+ "Wp": 240,
+ "n_instances": 0,
+ "min_size": 10,
+ "mask_threshold": 0.53,
+ "peak_distance": 5,
+ "seed_threshold": 0.7,
+ "overlap_threshold": 0.3,
+ "fg_threshold": 0.5,
+ "window_size": 32,
+ "cleanup_fragments": true
+}

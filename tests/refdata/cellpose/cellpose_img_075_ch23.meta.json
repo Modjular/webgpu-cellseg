@@ -1,0 +1,17 @@
+{
+ "name": "cellpose_img_075_ch23",
+ "H": 300,
+ "W": 240,
+ "Hp": 304,
+ "Wp": 240,
+ "channels": [
+  2,
+  3
+ ],
+ "diameter": 30.0,
+ "niter": 200,
+ "cellprob_threshold": 0.0,
+ "flow_threshold": 0.4,
+ "min_size": 15,
+ "n_masks": 149
+}
