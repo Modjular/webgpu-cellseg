@@ -37,6 +37,12 @@
     <select id="img"></select>
     <label>Or upload</label>
     <input id="file" type="file" accept="image/*,.tif,.tiff">
+    <div id="chanBox" style="display:none">
+      <label>Segment channel</label>
+      <select id="chSeg"></select>
+      <label>Nuclear channel (optional)</label>
+      <select id="chNuc"></select>
+    </div>
     <label>Diameter (px)</label>
     <input id="diam" type="number" value="30" step="1" min="5">
     <label>Cellprob threshold</label>
@@ -74,6 +80,7 @@ const SAMPLES = ["cellpose_image_020", "cellpose_img_003", "cellpose_img_075"];
 const $ = id => document.getElementById(id);
 const log = m => { $("log").textContent = m; };
 let cp = null;
+let currentSource = null;
 
 for (const s of SAMPLES) { const o = document.createElement("option"); o.value = s; o.textContent = s; $("img").appendChild(o); }
 
@@ -114,8 +121,11 @@ async function loadImageData(src) {
     im.onerror = (e) => { done(); rej(e); }; im.src = src;
   });
 }
-async function loadTiff(file) {
-  const ifd = decodeTiff(new Uint8Array(await file.arrayBuffer()))[0];
+// --- TIFF decode: multi-page (channel stacks) + multi-sample (interleaved) planes ---
+// Fluorescence multichannel TIFFs are usually one *page* per channel (ImageJ/OME
+// convention), not interleaved samples-per-pixel in a single page — see GOTCHAS §9.
+function isThumbnailSubfile(ifd) { return ((ifd.newSubfileType ?? 0) & 1) !== 0; }
+function legacyIfdToImageData(ifd) {
   const { data, width:W, height:H, components:C } = ifd;
   const bps = Array.isArray(ifd.bitsPerSample) ? ifd.bitsPerSample[0] : ifd.bitsPerSample;
   let lo = 0, scale;
@@ -134,7 +144,65 @@ async function loadTiff(file) {
   }
   return out;
 }
-function loadUpload(file) { return /\.tiff?$/i.test(file.name) ? loadTiff(file) : loadImageData(URL.createObjectURL(file)); }
+function extractPlane(data, W, H, c, C) {
+  const out = new Float32Array(W * H);
+  for (let i = 0; i < W * H; i++) out[i] = data[i * C + c];
+  return out;
+}
+const COMP_NAMES = ["R", "G", "B", "A"];
+async function decodeTiffSource(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let ifds = decodeTiff(bytes).filter(ifd => !isThumbnailSubfile(ifd));
+  if (!ifds.length) ifds = decodeTiff(bytes);
+  const first = ifds[0], C0 = first.components ?? 1;
+  if (ifds.length === 1 && C0 <= 3) return { multi: false, imgData: legacyIfdToImageData(first) };
+  const { width:W, height:H } = first, planes = [];
+  ifds.forEach((ifd, p) => {
+    if (ifd.width !== W || ifd.height !== H) return;   // skip mismatched-size pages (e.g. pyramid levels)
+    const C = ifd.components ?? 1;
+    for (let c = 0; c < C; c++) {
+      const label = ifds.length > 1 ? `page ${p+1}${C > 1 ? "."+(COMP_NAMES[c]||"c"+c) : ""}` : (COMP_NAMES[c] || `ch${c}`);
+      planes.push({ label, data: extractPlane(ifd.data, W, H, c, C) });
+    }
+  });
+  return { multi: true, W, H, planes };
+}
+function meanPlane(planes, W, H) {
+  const out = new Float32Array(W * H);
+  for (const p of planes) for (let i = 0; i < W * H; i++) out[i] += p.data[i] / planes.length;
+  return out;
+}
+function loadUpload(file) {
+  return /\.tiff?$/i.test(file.name)
+    ? decodeTiffSource(file)
+    : loadImageData(URL.createObjectURL(file)).then(imgData => ({ multi: false, imgData }));
+}
+
+// --- Channel-selection UI: shown only for genuinely multi-plane sources ---
+function populateChannelSelect(sel, planes, { mean = false, none = false } = {}) {
+  sel.innerHTML = "";
+  if (mean) sel.appendChild(new Option("Mean (all channels)", "mean"));
+  if (none) sel.appendChild(new Option("None", ""));
+  planes.forEach((p, i) => sel.appendChild(new Option(p.label, i)));
+}
+function applyChannelUI(source) {
+  const box = $("chanBox");
+  if (!source.multi) { box.style.display = "none"; return; }
+  box.style.display = "";
+  populateChannelSelect($("chSeg"), source.planes, { mean: true });
+  populateChannelSelect($("chNuc"), source.planes, { none: true });
+  $("chSeg").value = "mean";
+  $("chNuc").value = "";
+}
+function selectChannels(source) {
+  if (!source.multi) { const { g, W, H } = toGray(source.imgData); return { gray: g, chan2: null, W, H }; }
+  const { W, H, planes } = source;
+  const segV = $("chSeg").value;
+  const gray = segV === "mean" ? meanPlane(planes, W, H) : planes[+segV].data;
+  const nucV = $("chNuc").value;
+  const chan2 = nucV === "" ? null : planes[+nucV].data;
+  return { gray, chan2, W, H };
+}
 function showInput(g, W, H) {
   drawGray($("cin"), g, W, H);
   $("cout").width = W; $("cout").height = H;
@@ -153,30 +221,34 @@ async function init() {
 
 async function preview(name) {
   $("file").value = "";
-  const { g, W, H } = toGray(await loadImageData("images/" + name + ".png"));
-  showInput(g, W, H);
+  currentSource = { multi: false, imgData: await loadImageData("images/" + name + ".png") };
+  applyChannelUI(currentSource);
+  const { gray, W, H } = selectChannels(currentSource);
+  showInput(gray, W, H);
 }
 async function previewFile(file) {
-  const { g, W, H } = toGray(await loadUpload(file));
-  showInput(g, W, H);
+  currentSource = await loadUpload(file);
+  applyChannelUI(currentSource);
+  const { gray, W, H } = selectChannels(currentSource);
+  showInput(gray, W, H);
   log("loaded " + file.name + " (" + W + "×" + H + "). Click Segment.");
 }
 
 async function run() {
   $("run").disabled = true;
   try {
-    let imgData, name = $("img").value;
+    let source, name = $("img").value;
     const f = $("file").files[0];
-    if (f) { imgData = await loadUpload(f); name = f.name; }
-    else { imgData = await loadImageData("images/" + name + ".png"); }
-    const { g, W, H } = toGray(imgData);
-    showInput(g, W, H);
+    if (f) { source = await loadUpload(f); name = f.name; }
+    else { source = { multi: false, imgData: await loadImageData("images/" + name + ".png") }; }
+    const { gray, chan2, W, H } = selectChannels(source);
+    showInput(gray, W, H);
     log("segmenting " + name + " (" + W + "×" + H + ")…");
-    const opts = { diameter:+$("diam").value, cellprob_threshold:+$("cthr").value, flow_threshold:+$("fthr").value, niter:+$("niter").value, min_size:15 };
+    const opts = { diameter:+$("diam").value, cellprob_threshold:+$("cthr").value, flow_threshold:+$("fthr").value, niter:+$("niter").value, min_size:15, chan2 };
     const t = performance.now();
-    const res = await cp.segmentImage(g, H, W, opts);
+    const res = await cp.segmentImage(gray, H, W, opts);
     const wall = performance.now() - t;
-    drawLabels($("cout"), res.labels, g, W, H);
+    drawLabels($("cout"), res.labels, gray, W, H);
     const n = res.labels.reduce((m,v)=>v>m?v:m,0);
     $("s_pre").textContent = res.timings.preprocess.toFixed(1)+" ms";
     $("s_fwd").textContent = res.timings.forward.toFixed(0)+" ms";
@@ -191,6 +263,8 @@ async function run() {
 $("run").addEventListener("click", run);
 $("img").addEventListener("change", e => preview(e.target.value));
 $("file").addEventListener("change", e => { if (e.target.files[0]) previewFile(e.target.files[0]); });
+$("chSeg").addEventListener("change", () => { if (currentSource) { const { gray, W, H } = selectChannels(currentSource); showInput(gray, W, H); } });
+$("chNuc").addEventListener("change", () => { if (currentSource) { const { gray, W, H } = selectChannels(currentSource); showInput(gray, W, H); } });
 init();
 </script>
 </body></html>

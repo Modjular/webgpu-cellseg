@@ -1,9 +1,8 @@
 # webgpu-cellseg
 
-Microscopy **cell/nucleus segmentation in the browser, on WebGPU** — three models ported to
-hand-written WGSL with a JavaScript instance-decode. **No PyTorch, no TensorFlow, no CUDA, no
-ML framework at inference time.** Each model is one self-contained ES module; import the one
-you need.
+Microscopy **cell/nucleus segmentation in the browser, on WebGPU**. These segmentation models
+run on WebGPU with a JavaScript instance-decode. **No PyTorch, no TensorFlow, no CUDA, no
+ML framework at inference time.** Each model is one self-contained ES module.
 
 | Model | Module | Task | Native diameter | Weights license |
 |---|---|---|---|---|
@@ -12,8 +11,8 @@ you need.
 | **InstanSeg** `brightfield_nuclei` | `src/instanseg.js` | brightfield nuclei | — | Apache-2.0 |
 
 The Cellpose port implements cellpose-exact **tiled inference**, so it matches desktop
-Cellpose at **AP@0.5 = 1.0** across diameters (not just the native one). The story behind
-that — and every other trap hit along the way — is in [`docs/GOTCHAS.md`](docs/GOTCHAS.md).
+Cellpose at **AP@0.5 = 1.0** across diameters (not just the native one). Read more about the
+porting journey in [`docs/GOTCHAS.md`](docs/GOTCHAS.md).
 
 ## Quickstart (demo)
 
@@ -36,14 +35,19 @@ import { CellposeWebGPU } from "./src/cellpose.js";
 // loads ./weights/cellpose-cyto3/{manifest.json,weights.bin} by default
 const cp = await CellposeWebGPU.load();
 
-// gray: Float32Array length H*W (any range; normalized internally)
-const { labels, timings } = await cp.segmentImage(gray, H, W, { diameter: 30 });
+// gray: Float32Array length H*W (any range; normalized internally) — the channel to segment
+// chan2 (optional): Float32Array length H*W, a second (nuclear) channel — cellpose's
+// channels=[cyto, nuclear]; omit for cellpose's grayscale mode (channels=[0,0]).
+const { labels, timings } = await cp.segmentImage(gray, H, W, { diameter: 30, chan2 });
 // labels: Int32Array[H*W], 0 = background, 1..N = instances
 ```
 
-`StarDistWebGPU` and `InstanSegWebGPU` follow the same shape (`.load()` → `.segmentImage()`),
-with model-specific options (StarDist: `prob_thresh`/`nms_thresh`; InstanSeg takes RGB +
-`seed_thresh`/`mask_thresh`). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+`StarDistWebGPU` and `InstanSegWebGPU` follow the same shape (`.load()` → `.segmentImage()`)
+but have a fixed, narrower channel contract — neither accepts extra channels. `StarDistWebGPU`
+(`prob_thresh`/`nms_thresh`) is strictly single-channel; `InstanSegWebGPU` (`seed_thresh`/
+`mask_thresh`) takes a fixed, order-sensitive 3-channel RGB input. See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and, for why each model's channel handling
+differs, [`docs/GOTCHAS.md`](docs/GOTCHAS.md) §8.
 
 ### Hosting the weights elsewhere
 

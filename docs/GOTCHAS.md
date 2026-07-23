@@ -155,3 +155,67 @@ Practical options:
 - **Committed in the repo** (what this repo does) — simplest and fully self-contained, at the
   cost of clone size. `Model.load(url)` takes a base URL so you can flip to a CDN with no code
   change; keep `tools/export_*.py` + `SHA256SUMS` so anyone can regenerate and verify.
+
+---
+
+## 8. "Channel-invariant" is a myth — each model's channel contract is different
+
+Multichannel microscopy input (a TIFF with several fluorescence channels, or a cyto+nuclear
+stain pair) is *not* handled the same way by all three models. None of them is simply
+"channel-invariant"; each has its own fixed contract, and picking the wrong plane for the
+wrong slot silently degrades results rather than erroring.
+
+- **Cellpose cyto3** has an explicit, order-sensitive two-channel contract, mirroring
+  upstream cellpose's `channels=[chan, chan2]`: `segmentImage(gray, H, W, {chan2})` — `gray`
+  is the channel to segment (cytoplasm), and the optional `chan2` is a second, nuclear
+  channel. Passing `chan2: null`/omitting it is cellpose's grayscale mode
+  (`channels=[0,0]`), which is a fully supported first-class mode — not a degraded fallback —
+  and is likely the source of the "channel-invariant" impression. But if you have real
+  separate cyto/nuclear stains, which plane you assign to `gray` vs. `chan2` is never
+  auto-inferred and does affect accuracy. `src/cellpose.js`'s `runNet`/`preprocess` already
+  implement the two-channel path; see `reference/baseline_pytorch.py`'s `select_channels()`
+  for the upstream channel-index convention (0=mean-of-RGB, 1=R, 2=G, 3=B) this mirrors.
+- **StarDist `2D_versatile_fluo`** is strictly single-channel — the WGSL forward hardcodes
+  `Cin=1` (`src/stardist.js`, "Preprocessing (single grayscale channel)"). There is no
+  multi-channel concept anywhere in that file. For multi-channel fluorescence input, pick
+  *one* plane (e.g. the nuclear/DAPI stain) — don't average unrelated channels together, that
+  mixes signal the model was never trained to interpret.
+- **InstanSeg `brightfield_nuclei`** is fixed 3-channel (`Cin=3` hardcoded), and channel
+  *order* is positional and baked into the trained conv weights — R/G/B must match
+  training-time semantics to mean anything. It's trained on true brightfield/H&E-style RGB;
+  there is no documented, principled mapping from arbitrary fluorescence channels into its
+  R/G/B slots. Treat any such remapping (e.g. feeding 3 unrelated fluorescence channels in as
+  "RGB") as a rough surrogate, not a validated mode.
+
+The demo pages (`demo/*.html`) now expose per-model channel selection for multichannel
+uploads — a "Segment"/"Nuclear" pair for Cellpose, a single required selector for StarDist, and
+R/G/B slot pickers for InstanSeg — all defaulting to "mean of all planes" (Cellpose/StarDist)
+or the first three planes in order (InstanSeg) to reproduce prior zero-config behavior on
+ordinary RGB uploads.
+
+---
+
+## 9. Multi-page vs. interleaved TIFFs: the `[0]` trap
+
+Multi-channel fluorescence TIFFs are usually stored as **separate IFD pages** — one page per
+channel/Z-slice/timepoint (the ImageJ hyperstack / OME-TIFF convention) — not as interleaved
+samples-per-pixel inside a single page. It's easy to decode a TIFF, grab `pages[0]`, and
+conclude "multichannel TIFFs work" because a single-page **interleaved** RGB TIFF (where
+`components`/`samplesPerPixel` > 1 within one page) does fully decode that way — but a
+genuine multi-page channel stack silently loses every channel but the first.
+
+The `tiff` npm package (`decode(bytes)`, no `pages` filter) already decodes *every* page into
+the returned array — this is not a library limitation, just an indexing bug waiting to
+happen (`decode(bytes)[0]`). The fix is to walk the whole array and treat multi-page and
+multi-sample-per-pixel as two independent axes that can both be present.
+
+Two related traps once you do that:
+- **`TiffIfd.newSubfileType`** (TIFF tag 254, a bitmask) — bit 0 marks "reduced-resolution
+  version of another image." Some TIFF writers embed a thumbnail/preview as an extra page;
+  filter those out (`(newSubfileType ?? 0) & 1`) before treating page count as channel count,
+  or you'll offer a bogus low-res "channel" alongside the real ones.
+- **`PlanarConfiguration=2`** (fully planar, non-chunky sample storage) is not handled by
+  this repo's demo TIFF loader — plane extraction assumes chunky/interleaved layout
+  (`data[i*C+c]`) throughout, matching what the original single-page loader already assumed.
+  No planar test fixture exists in-repo to verify against; treat this as a known, undocumented
+  limitation if you hit it.
