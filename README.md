@@ -24,8 +24,9 @@ python3 -m http.server 8000
 # then open http://localhost:8000/demo/
 ```
 
-Pick a model, pick or upload an image, hit **Segment**. Requires a WebGPU browser
-(Chrome/Edge 113+, or Safari 18+).
+Pick a model, pick or upload an image (PNG/JPEG/etc., or **TIFF** — including 16-bit/float
+grayscale, decoded client-side via the [`tiff`](https://www.npmjs.com/package/tiff) package
+from jsDelivr), hit **Segment**. Requires a WebGPU browser (Chrome/Edge 113+, or Safari 18+).
 
 ## Use as a library
 

@@ -35,7 +35,7 @@
     <label>Sample image</label>
     <select id="img"></select>
     <label>Or upload</label>
-    <input id="file" type="file" accept="image/*">
+    <input id="file" type="file" accept="image/*,.tif,.tiff">
     <label>Probability threshold</label>
     <input id="pthr" type="number" value="0.479" step="0.05" min="0" max="1">
     <label>NMS (overlap) threshold</label>
@@ -63,6 +63,7 @@
 </main>
 <script type="module">
 import { StarDistWebGPU } from "../src/stardist.js";
+import { decode as decodeTiff } from "https://cdn.jsdelivr.net/npm/tiff@7.1.3/+esm";
 
 const SAMPLES = ["cellpose_image_020", "cellpose_img_003", "cellpose_img_075"];
 const $ = id => document.getElementById(id);
@@ -108,6 +109,27 @@ async function loadImageData(src) {
     im.onerror = (e) => { done(); rej(e); }; im.src = src;
   });
 }
+async function loadTiff(file) {
+  const ifd = decodeTiff(new Uint8Array(await file.arrayBuffer()))[0];
+  const { data, width:W, height:H, components:C } = ifd;
+  const bps = Array.isArray(ifd.bitsPerSample) ? ifd.bitsPerSample[0] : ifd.bitsPerSample;
+  let lo = 0, scale;
+  if (data instanceof Float32Array) {
+    let hi = -Infinity; lo = Infinity;
+    for (let i = 0; i < data.length; i++) { const v = data[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    scale = 255 / (hi - lo + 1e-9);
+  } else scale = 255 / (2 ** bps - 1);
+  const out = new ImageData(W, H);
+  for (let i = 0; i < W * H; i++) {
+    const base = i * C, r = (data[base] - lo) * scale;
+    out.data[i*4]   = r;
+    out.data[i*4+1] = C > 1 ? (data[base+1] - lo) * scale : r;
+    out.data[i*4+2] = C > 2 ? (data[base+2] - lo) * scale : r;
+    out.data[i*4+3] = 255;
+  }
+  return out;
+}
+function loadUpload(file) { return /\.tiff?$/i.test(file.name) ? loadTiff(file) : loadImageData(URL.createObjectURL(file)); }
 function showInput(g, W, H) {
   drawGray($("cin"), g, W, H);
   $("cout").width = W; $("cout").height = H;
@@ -130,7 +152,7 @@ async function preview(name) {
   showInput(g, W, H);
 }
 async function previewFile(file) {
-  const { g, W, H } = toGray(await loadImageData(URL.createObjectURL(file)));
+  const { g, W, H } = toGray(await loadUpload(file));
   showInput(g, W, H);
   log("loaded " + file.name + " (" + W + "×" + H + "). Click Segment.");
 }
@@ -140,7 +162,7 @@ async function run() {
   try {
     let imgData, name = $("img").value;
     const f = $("file").files[0];
-    if (f) { imgData = await loadImageData(URL.createObjectURL(f)); name = f.name; }
+    if (f) { imgData = await loadUpload(f); name = f.name; }
     else { imgData = await loadImageData("images/" + name + ".png"); }
     const { g, W, H } = toGray(imgData);
     showInput(g, W, H);
