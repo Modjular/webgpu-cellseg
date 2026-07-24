@@ -276,6 +276,10 @@ export class StarDistWebGPU {
       d.queue.writeBuffer(buf, 0, arr);
       this.buf[name] = buf;
     }
+    // The first conv's input channels (1 for the grayscale fluo model, 3 for the
+    // RGB H&E model) — read straight off its weight tensor rather than duplicated
+    // as separate manifest metadata.
+    this.nChannelIn = this.tensors["conv2d.w"].shape[1];
   }
 
   // Convenience loader: fetch manifest.json + weights.bin from a base URL and
@@ -377,10 +381,12 @@ export class StarDistWebGPU {
     enc.copyBufferToBuffer(bBuf, 0, outBuf, Ca * HW * 4, Cb * HW * 4);
   }
 
-  // ---- U-Net forward: [1,Hp,Wp] input -> prob[gh,gw] + dist[gh,gw,32] ----
+  // ---- U-Net forward: [Cin,Hp,Wp] input -> prob[gh,gw] + dist[gh,gw,32] ----
+  // Cin is 1 for the grayscale fluo model, 3 for the RGB H&E model (this.nChannelIn,
+  // set from the loaded weights' first conv shape).
   async forwardFromInput(inputF32, Hp, Wp) {
     const d = this.device;
-    const inBuf = this.mkStorage(Hp * Wp);
+    const inBuf = this.mkStorage(this.nChannelIn * Hp * Wp);
     d.queue.writeBuffer(inBuf, 0, inputF32);
     const enc = d.createCommandEncoder();
     const C = (name, i, o, H, W, cin, cout, k, relu) => {
@@ -389,7 +395,7 @@ export class StarDistWebGPU {
       return b;
     };
     // grid block (full res) -> pool to the (2,2) grid
-    const c0 = C("conv2d", inBuf, null, Hp, Wp, 1, 32, 3, true);
+    const c0 = C("conv2d", inBuf, null, Hp, Wp, this.nChannelIn, 32, 3, true);
     const c1 = C("conv2d_1", c0, null, Hp, Wp, 32, 32, 3, true);
     const gh = Hp >> 1, gw = Wp >> 1;
     const p0 = this.mkStorage(32 * gh * gw); this.pool(enc, c1, p0, Hp, Wp, 32);
@@ -532,11 +538,16 @@ export class StarDistWebGPU {
     return polygonsToLabel(cyS, cxS, distsS, kept, Hp, Wp);
   }
 
-  async segmentImage(gray, H, W, opts = {}) {
+  // `input` is a single grayscale [H,W] Float32Array (fluo, Cin=1) or an array of
+  // `nChannelIn` such arrays (H&E, Cin=3, e.g. [r,g,b]) — each channel is percentile-
+  // normalized independently (StarDist's own axis_norm=(0,1) convention) before
+  // being reflect-padded and stacked into the net's [Cin,Hp,Wp] input.
+  async segmentImage(input, H, W, opts = {}) {
     const { gpu = true } = opts;
     const t0 = now();
-    const norm = normalize99(gray);
-    const { data, Hp, Wp } = padTo16(norm, H, W);
+    const channels = Array.isArray(input) ? input : [input];
+    const normed = channels.map(ch => normalize99(ch));
+    const { data, Hp, Wp } = padChannelsTo16(normed, H, W);
     const t1 = now();
     const { prob, dist, gh, gw } = await this.forwardFromInput(data, Hp, Wp);
     const t2 = now();
@@ -685,6 +696,19 @@ export function padTo16(ch, H, W) {
     data[y * Wp + x] = data[Math.max(0, 2 * H - 1 - y) * Wp + x];
   for (let y = 0; y < Hp; y++) for (let x = W; x < Wp; x++)                 // reflect cols
     data[y * Wp + x] = data[y * Wp + Math.max(0, 2 * W - 1 - x)];
+  return { data, Hp, Wp };
+}
+
+// Reflect-pad each of `channels` (already-normalized [H,W] arrays) the same way as
+// padTo16, then stack them into a single [Cin,Hp,Wp] net input.
+export function padChannelsTo16(channels, H, W) {
+  const Cin = channels.length;
+  const { Hp, Wp } = padTo16(channels[0], H, W);
+  const data = new Float32Array(Cin * Hp * Wp);
+  channels.forEach((ch, c) => {
+    const { data: chData } = padTo16(ch, H, W);
+    data.set(chData, c * Hp * Wp);
+  });
   return { data, Hp, Wp };
 }
 
