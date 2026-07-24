@@ -187,15 +187,16 @@ wrong slot silently degrades results rather than erroring.
   R/G/B slots. Treat any such remapping (e.g. feeding 3 unrelated fluorescence channels in as
   "RGB") as a rough surrogate, not a validated mode.
 
-The demo pages (`demo/*.html`) now expose per-model channel selection for multichannel
+The demo pages (`demo/*.html`) expose per-model channel selection for multichannel
 uploads — a "Segment"/"Nuclear" pair for Cellpose, a single required selector for StarDist, and
 R/G/B slot pickers for InstanSeg — all defaulting to "mean of all planes" (Cellpose/StarDist)
-or the first three planes in order (InstanSeg) to reproduce prior zero-config behavior on
-ordinary RGB uploads.
+or the first three planes in order (InstanSeg) to numerically reproduce prior zero-config
+behavior on ordinary RGB uploads. The selector only *appears* for genuinely multi-plane
+sources (see §9) — a plain single-channel image never shows it.
 
 ---
 
-## 9. Multi-page vs. interleaved TIFFs: the `[0]` trap
+## 9. Multi-page vs. interleaved TIFFs: the `[0]` trap, and why "≤3 components = RGB" doesn't work either
 
 Multi-channel fluorescence TIFFs are usually stored as **separate IFD pages** — one page per
 channel/Z-slice/timepoint (the ImageJ hyperstack / OME-TIFF convention) — not as interleaved
@@ -207,15 +208,60 @@ genuine multi-page channel stack silently loses every channel but the first.
 The `tiff` npm package (`decode(bytes)`, no `pages` filter) already decodes *every* page into
 the returned array — this is not a library limitation, just an indexing bug waiting to
 happen (`decode(bytes)[0]`). The fix is to walk the whole array and treat multi-page and
-multi-sample-per-pixel as two independent axes that can both be present.
+multi-sample-per-pixel as two independent axes that can both be present — implemented once in
+`demo/tiff-loader.js`'s `decodeTiffSource`, imported by all three demos (see below).
 
-Two related traps once you do that:
+**A second, less obvious trap: don't special-case "few components" as "must be an ordinary
+RGB/grayscale image."** An earlier version of this loader routed any single-page TIFF with
+`components ≤ 3` through a separate "legacy" path that (a) quantized the data to an 8-bit
+`ImageData` before segmentation — silently posterizing exactly the 16-bit/float grayscale
+input this feature exists to support — and (b) skipped the channel-selection UI entirely,
+so a genuine single-page 2-channel dual-stain scan (e.g. DAPI+GFP stored as
+`SamplesPerPixel=2`) got its two channels silently blended together with no way to pick one.
+**There is no reliable component-count heuristic for "this is a real color photo, not
+scientific multi-channel data"** — component count alone can't distinguish them. The fix:
+decode every TIFF into the same lossless per-plane representation regardless of page/component
+count (`extractPlane` → `Float32Array`, never an 8-bit `ImageData`), and drive the "show the
+channel picker" decision purely off `planes.length > 1`. A genuine RGB TIFF now also shows the
+picker (defaulting to mean-of-RGB / first-three-planes-in-order, numerically identical to the
+old hidden-picker behavior) — a UI-visibility change, not a numeric regression, and it means a
+real multi-channel scan can never again be silently misclassified as "just RGB."
+
+Two related traps once you do this:
 - **`TiffIfd.newSubfileType`** (TIFF tag 254, a bitmask) — bit 0 marks "reduced-resolution
   version of another image." Some TIFF writers embed a thumbnail/preview as an extra page;
   filter those out (`(newSubfileType ?? 0) & 1`) before treating page count as channel count,
   or you'll offer a bogus low-res "channel" alongside the real ones.
-- **`PlanarConfiguration=2`** (fully planar, non-chunky sample storage) is not handled by
-  this repo's demo TIFF loader — plane extraction assumes chunky/interleaved layout
-  (`data[i*C+c]`) throughout, matching what the original single-page loader already assumed.
-  No planar test fixture exists in-repo to verify against; treat this as a known, undocumented
+- **`TiffIfd.alpha`** — a boolean the library derives from the `ExtraSamples` tag. A trailing
+  alpha sample is not imaging data and was previously getting exposed as a selectable channel
+  (and silently pulled into the "mean of all channels" default) for any RGBA TIFF. Exclude it
+  when building `planes[]`, don't just hide it in the UI.
+- **Bit-depth-dependent scaling is a trap in its own right, so avoid it entirely if you can.**
+  The old quantizing path computed `scale = 255 / (2**bitsPerSample - 1)`, which (a) ignores
+  the TIFF's actual `MaxSampleValue`/`MinSampleValue` tags — `TiffIfd` already exposes correct
+  `maxSampleValue`/`minSampleValue` getters that honor them, falling back to the same formula
+  only when absent, so hand-rolling the default-only formula silently mis-scales e.g. 12-bit
+  sensor data stored in a 16-bit container — and (b) assumed `bitsPerSample` is always a
+  defined number and `data` is always `Uint8/16Array` or `Float32Array`. Neither holds: the
+  optional `BitsPerSample` tag can be absent (`bitsPerSample → undefined → 2**undefined =
+  NaN → scale = NaN`), and 64-bit IEEE-float samples decode to `Float64Array`, not
+  `Float32Array`, silently zeroing the scale (`255 / (2**64-1) ≈ 1.4e-17`). Both turn into an
+  all-black image with no error. Working in the model's native `Float32Array` space (no
+  display-range scaling at all until the final on-screen preview stretch, which does its own
+  per-plane min/max — see `drawGray`/`drawRGBPlanes` in the demo files) sidesteps this whole
+  class of bug rather than trying to enumerate every TIFF sample-format variant correctly.
+- **`PlanarConfiguration=2`** (fully planar, non-chunky sample storage) is still not handled —
+  plane extraction assumes chunky/interleaved layout (`data[i*stride+c]`) throughout. No
+  planar test fixture exists in-repo to verify against; treat this as a known, undocumented
   limitation if you hit it.
+
+**On duplication:** the TIFF-decode logic (`isThumbnailSubfile`/`extractPlane`/
+`decodeTiffSource`) lives once, in `demo/tiff-loader.js`, and is imported by all three demos —
+it's real binary-format parsing with the sharp edges above, not the kind of trivial
+per-demo glue (`drawGray`, `drawLabels`) worth re-deriving three times. The exported surface is
+deliberately small: `loadSource(input)` (a sample-image URL string or an uploaded `File`,
+TIFF or otherwise, → a uniform `{multi, imgData}` or `{multi, W, H, planes}` source) and
+`meanPlane(planes, W, H)`. `loadSource` also memoizes TIFF decodes per `File` object, since
+`run()` and the preview handlers both load the same uploaded file independently — without that,
+every "Segment" click on an uploaded multi-page stack re-walked every IFD and re-extracted
+every plane from scratch.

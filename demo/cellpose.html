@@ -74,22 +74,17 @@
 </main>
 <script type="module">
 import { CellposeWebGPU } from "../src/cellpose.js";
-import { decode as decodeTiff } from "https://cdn.jsdelivr.net/npm/tiff@7.1.3/+esm";
+import { loadSource, meanPlane } from "./tiff-loader.js";
 
 const SAMPLES = ["cellpose_image_020", "cellpose_img_003", "cellpose_img_075"];
 const $ = id => document.getElementById(id);
 const log = m => { $("log").textContent = m; };
 let cp = null;
 let currentSource = null;
+let loadGen = 0;   // guards against a slow load resolving after a newer one clobbers currentSource
 
 for (const s of SAMPLES) { const o = document.createElement("option"); o.value = s; o.textContent = s; $("img").appendChild(o); }
 
-function toGray(imgData) {
-  const { data, width:W, height:H } = imgData;
-  const g = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) g[i] = (data[i*4] + data[i*4+1] + data[i*4+2]) / 3;
-  return { g, W, H };
-}
 function drawGray(canvas, g, W, H) {
   canvas.width = W; canvas.height = H;
   const ctx = canvas.getContext("2d"), id = ctx.createImageData(W, H);
@@ -113,70 +108,6 @@ function drawLabels(canvas, labels, g, W, H) {
   }
   ctx.putImageData(id, 0, 0);
 }
-async function loadImageData(src) {
-  const done = () => { if (src.startsWith("blob:")) URL.revokeObjectURL(src); };
-  return new Promise((res, rej) => {
-    const im = new Image(); im.crossOrigin = "anonymous";
-    im.onload = () => { const c=document.createElement("canvas"); c.width=im.width; c.height=im.height; const x=c.getContext("2d"); x.drawImage(im,0,0); done(); res(x.getImageData(0,0,im.width,im.height)); };
-    im.onerror = (e) => { done(); rej(e); }; im.src = src;
-  });
-}
-// --- TIFF decode: multi-page (channel stacks) + multi-sample (interleaved) planes ---
-// Fluorescence multichannel TIFFs are usually one *page* per channel (ImageJ/OME
-// convention), not interleaved samples-per-pixel in a single page — see GOTCHAS §9.
-function isThumbnailSubfile(ifd) { return ((ifd.newSubfileType ?? 0) & 1) !== 0; }
-function legacyIfdToImageData(ifd) {
-  const { data, width:W, height:H, components:C } = ifd;
-  const bps = Array.isArray(ifd.bitsPerSample) ? ifd.bitsPerSample[0] : ifd.bitsPerSample;
-  let lo = 0, scale;
-  if (data instanceof Float32Array) {
-    let hi = -Infinity; lo = Infinity;
-    for (let i = 0; i < data.length; i++) { const v = data[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
-    scale = 255 / (hi - lo + 1e-9);
-  } else scale = 255 / (2 ** bps - 1);
-  const out = new ImageData(W, H);
-  for (let i = 0; i < W * H; i++) {
-    const base = i * C, r = (data[base] - lo) * scale;
-    out.data[i*4]   = r;
-    out.data[i*4+1] = C > 1 ? (data[base+1] - lo) * scale : r;
-    out.data[i*4+2] = C > 2 ? (data[base+2] - lo) * scale : r;
-    out.data[i*4+3] = 255;
-  }
-  return out;
-}
-function extractPlane(data, W, H, c, C) {
-  const out = new Float32Array(W * H);
-  for (let i = 0; i < W * H; i++) out[i] = data[i * C + c];
-  return out;
-}
-const COMP_NAMES = ["R", "G", "B", "A"];
-async function decodeTiffSource(file) {
-  const bytes = new Uint8Array(await file.arrayBuffer());
-  let ifds = decodeTiff(bytes).filter(ifd => !isThumbnailSubfile(ifd));
-  if (!ifds.length) ifds = decodeTiff(bytes);
-  const first = ifds[0], C0 = first.components ?? 1;
-  if (ifds.length === 1 && C0 <= 3) return { multi: false, imgData: legacyIfdToImageData(first) };
-  const { width:W, height:H } = first, planes = [];
-  ifds.forEach((ifd, p) => {
-    if (ifd.width !== W || ifd.height !== H) return;   // skip mismatched-size pages (e.g. pyramid levels)
-    const C = ifd.components ?? 1;
-    for (let c = 0; c < C; c++) {
-      const label = ifds.length > 1 ? `page ${p+1}${C > 1 ? "."+(COMP_NAMES[c]||"c"+c) : ""}` : (COMP_NAMES[c] || `ch${c}`);
-      planes.push({ label, data: extractPlane(ifd.data, W, H, c, C) });
-    }
-  });
-  return { multi: true, W, H, planes };
-}
-function meanPlane(planes, W, H) {
-  const out = new Float32Array(W * H);
-  for (const p of planes) for (let i = 0; i < W * H; i++) out[i] += p.data[i] / planes.length;
-  return out;
-}
-function loadUpload(file) {
-  return /\.tiff?$/i.test(file.name)
-    ? decodeTiffSource(file)
-    : loadImageData(URL.createObjectURL(file)).then(imgData => ({ multi: false, imgData }));
-}
 
 // --- Channel-selection UI: shown only for genuinely multi-plane sources ---
 function populateChannelSelect(sel, planes, { mean = false, none = false } = {}) {
@@ -195,8 +126,15 @@ function applyChannelUI(source) {
   $("chNuc").value = "";
 }
 function selectChannels(source) {
-  if (!source.multi) { const { g, W, H } = toGray(source.imgData); return { gray: g, chan2: null, W, H }; }
-  const { W, H, planes } = source;
+  const { W, H } = source;
+  if (source.imgData) {
+    const { data } = source.imgData;
+    const gray = new Float32Array(W * H);
+    for (let i = 0; i < W * H; i++) gray[i] = (data[i*4] + data[i*4+1] + data[i*4+2]) / 3;
+    return { gray, chan2: null, W, H };
+  }
+  const { planes } = source;
+  if (!source.multi) return { gray: meanPlane(planes, W, H), chan2: null, W, H };   // single plane: mean === the plane itself
   const segV = $("chSeg").value;
   const gray = segV === "mean" ? meanPlane(planes, W, H) : planes[+segV].data;
   const nucV = $("chNuc").value;
@@ -221,17 +159,25 @@ async function init() {
 
 async function preview(name) {
   $("file").value = "";
-  currentSource = { multi: false, imgData: await loadImageData("images/" + name + ".png") };
+  const gen = ++loadGen;
+  const source = await loadSource("images/" + name + ".png");
+  if (gen !== loadGen) return;   // a newer selection resolved first — drop this stale result
+  currentSource = source;
   applyChannelUI(currentSource);
   const { gray, W, H } = selectChannels(currentSource);
   showInput(gray, W, H);
 }
 async function previewFile(file) {
-  currentSource = await loadUpload(file);
-  applyChannelUI(currentSource);
-  const { gray, W, H } = selectChannels(currentSource);
-  showInput(gray, W, H);
-  log("loaded " + file.name + " (" + W + "×" + H + "). Click Segment.");
+  const gen = ++loadGen;
+  try {
+    const source = await loadSource(file);
+    if (gen !== loadGen) return;
+    currentSource = source;
+    applyChannelUI(currentSource);
+    const { gray, W, H } = selectChannels(currentSource);
+    showInput(gray, W, H);
+    log("loaded " + file.name + " (" + W + "×" + H + "). Click Segment.");
+  } catch (e) { if (gen === loadGen) { log("error: " + e.message); console.error(e); } }
 }
 
 async function run() {
@@ -239,8 +185,8 @@ async function run() {
   try {
     let source, name = $("img").value;
     const f = $("file").files[0];
-    if (f) { source = await loadUpload(f); name = f.name; }
-    else { source = { multi: false, imgData: await loadImageData("images/" + name + ".png") }; }
+    if (f) { source = await loadSource(f); name = f.name; }   // cheap: loadSource caches per File
+    else { source = await loadSource("images/" + name + ".png"); }
     const { gray, chan2, W, H } = selectChannels(source);
     showInput(gray, W, H);
     log("segmenting " + name + " (" + W + "×" + H + ")…");
