@@ -21,8 +21,30 @@ function extractPlane(data, W, H, c, stride) {
 
 const COMP_NAMES = ["R", "G", "B"];
 
+// The `tiff` package only decodes uncompressed/LZW/Deflate pixel data (Compression
+// 1/5/8/32946) and only WhiteIsZero/BlackIsZero/RGB/Palette photometric interpretations
+// (PhotometricInterpretation 0/1/2/3) — anything else throws a cryptic internal error
+// ("Unsupported image type: N") deep in the decoder. JPEG-compressed whole-slide-image
+// TIFFs (common Bio-Formats/QuPath export: Compression=7, PhotometricInterpretation=6
+// YCbCr) are the case most likely to be hit here. Check the cheap tags-only decode
+// (ignoreImageData skips the actual pixel-format switch that throws) so we can fail
+// with an actionable message instead.
+const UNSUPPORTED_COMPRESSION = { 2: "CCITT Group 3", 3: "CCITT Group 4", 6: "old-style JPEG", 7: "JPEG", 32773: "PackBits" };
+const UNSUPPORTED_PHOTOMETRIC = { 4: "transparency mask", 5: "CMYK", 6: "YCbCr (often a JPEG-compressed whole-slide scan)", 8: "CIELab" };
+
+function assertDecodable(bytes) {
+  for (const ifd of decodeTiff(bytes, { ignoreImageData: true })) {
+    if (isThumbnailSubfile(ifd)) continue;
+    const badComp = UNSUPPORTED_COMPRESSION[ifd.compression];
+    if (badComp) throw new Error(`This TIFF uses ${badComp} compression, which this in-browser decoder can't read. Re-export as uncompressed/LZW/Deflate-compressed TIFF, or convert to PNG.`);
+    const badPhoto = UNSUPPORTED_PHOTOMETRIC[ifd.type];
+    if (badPhoto) throw new Error(`This TIFF uses ${badPhoto} color encoding, which this in-browser decoder can't read. Re-export as an RGB/grayscale TIFF, or convert to PNG.`);
+  }
+}
+
 async function decodeTiffSource(file) {
   const bytes = new Uint8Array(await file.arrayBuffer());
+  assertDecodable(bytes);
   let ifds = decodeTiff(bytes).filter(ifd => !isThumbnailSubfile(ifd));
   if (!ifds.length) ifds = decodeTiff(bytes);
   const { width: W, height: H } = ifds[0];
@@ -53,7 +75,7 @@ async function decodeImageSource(src) {
     im.onerror = e => { done(); rej(e); };
     im.src = src;
   });
-  return { multi: false, imgData };
+  return { multi: false, W: imgData.width, H: imgData.height, imgData };
 }
 
 // Avoids re-decoding the same upload on every Segment click (run() and the
@@ -62,8 +84,9 @@ const tiffCache = new WeakMap();
 
 /**
  * Loads a sample-image URL (string) or an uploaded File (TIFF or ordinary
- * image) into a uniform Source: { multi:false, imgData } for plain images,
- * or { multi, W, H, planes } for TIFFs (planes.length may be 1).
+ * image) into a uniform Source: { multi:false, W, H, imgData } for plain
+ * images, or { multi, W, H, planes } for TIFFs (planes.length may be 1).
+ * W/H are always present at the top level regardless of source kind.
  */
 export function loadSource(input) {
   if (input instanceof File) {
