@@ -3,6 +3,9 @@
 **Temporary.** Delete this once the contents have been folded into `README.md` /
 `docs/ARCHITECTURE.md` or into a PR description.
 
+Everything here is committed on branch `perf/conv-kernel-and-flow-qc` in two commits: the
+Cellpose work plus tooling, then the StarDist/InstanSeg port.
+
 This transfers a Cellpose optimisation effort that was carried out in a downstream repo
 which vendors these modules. The engine changes are **~10× end-to-end on Cellpose** with
 segmentation output unchanged, plus the measurement tooling that produced them.
@@ -31,8 +34,11 @@ exactly as before.
 
 - `src/cellpose.js` — new conv kernel, GPU flow-consistency QC, stage instrumentation,
   compute-pass labels, a `_mkEncoder` hook for profiling.
-- `src/stardist.js`, `src/instanseg.js` — device acquisition only, via `src/device.js`.
-  **Their kernels are untouched.**
+- `src/stardist.js`, `src/instanseg.js` — now share the same conv kernel in its "plain"
+  form, plus device acquisition, the profiling hook and labelled passes.
+  **StarDist forward 103 ms → 34 ms (3.0×); InstanSeg 434 ms → 83 ms (5.2×)**, both with
+  AP@0.5 = 1.000 and identical mask counts. Gains are smaller than Cellpose's because
+  both nets are shallower and neither had BN work to fuse into the staging load.
 
 ---
 
@@ -144,32 +150,44 @@ anything, and reports progress as it goes.
 
 ---
 
+## Status of the plan
+
+Done: the Cellpose work, the StarDist/InstanSeg port, and vendoring into the downstream
+repo (which now consumes `vendor/webgpu-cellseg/` and no longer carries its own copy of
+the engines or the profiling tooling).
+
 ## What's next, cheapest first
 
-1. **Port the kernel to StarDist and InstanSeg.** They still carry the old conv — same
-   16×16 shape, same dynamically-indexed accumulator, measured at ~4.5% of roof. This is
-   mechanical work with a known ~10× at the end of it, and it is the reason
-   `src/conv-kernel.js` is generated rather than inlined. Their conv signatures differ
-   slightly (no `useAdd`/`useResid`), so either extend the generator or accept a variant.
-2. **`subgroup-matrix`** (Metal simdgroup matmul) — available on this adapter, unused.
+1. **`subgroup-matrix`** (Metal simdgroup matmul) — available on this adapter, unused.
    The conv is at ~40% of roof and parameter tuning is exhausted, so this is the only
    substantial lever left on it. Real rewrite: implicit GEMM with im2col in shared memory.
-3. **The flow-QC kernel dispatches over the whole image** regardless of mask coverage,
+2. **The flow-QC kernel dispatches over the whole image** regardless of mask coverage,
    which is why the small-mask case gained ~1.8× against the large-mask case's 8.2×.
    Bound the dispatch to the union of mask bounding boxes, or compact mask pixels.
-4. **Re-test f16** properly (see above).
-5. **Mask assembly after the flow QC** — seed growth and label assignment — is the next
+3. **Re-test f16** properly (see above).
+4. **Mask assembly after the flow QC** — seed growth and label assignment — is the next
    CPU item once the above shrink around it.
+5. **Re-measure StarDist and InstanSeg.** Their conv shapes were never profiled — the
+   constants in `conv-kernel.js` were tuned on Cellpose's layer shapes and inherited.
+   `SHAPES` in `src/profile/convbench.js` is Cellpose-only; adding their shapes would show
+   whether one set of constants really suits all three, or whether the shallower nets want
+   a different split. Their 3.0×/5.2× against Cellpose's 11× is a hint that they might.
+6. **A profiling cross-check across engines.** `demo/profile.html` had a panel comparing a
+   second engine; it was removed when only Cellpose had the new kernel. Now that all three
+   share it, that is the natural regression against the whole family.
 
 ---
 
 ## Loose ends
 
-- `demo/profile.html` was adapted from a downstream page; its cross-check section (which
-  compared a second engine) was removed rather than left as dead code. Put it back when
-  StarDist gets the new kernel — the comparison is the natural regression for item 1.
 - `tools/profile.mjs` and `demo/profile.html` define their workloads independently. They
   agree today; they will drift.
+- `src/profile/convbench.js`'s `SHAPES` and its time-share weights are Cellpose's. Any
+  variant scored there is scored against Cellpose's mix, which is now only part of what
+  the kernel serves — see item 5.
+- Both engines prebuild conv pipelines for K∈{1,3} in their constructors. Correct for
+  every current checkpoint, and anything else is built lazily, but a checkpoint using
+  another kernel size silently pays shader compilation on its first forward.
 - Workloads are built from `tests/refdata/cellpose_img_075` (240×300), including a
   synthetic 3×3 tiling to reach a multi-tile working resolution. Real content at a larger
   size would profile the tiling path more honestly.
