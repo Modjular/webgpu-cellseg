@@ -14,6 +14,8 @@
 // residual/skip merges are elementwise adds (ADD_WGSL). Output = 2 coord fields +
 // 2 sigma + 1 seed channel; the decode grows one instance from each seed.
 
+import { requestDevice } from "./device.js";
+
 const BLK = 8, TS = 16, TW = TS + 2;
 const N_COORD = 2, N_SIGMA = 2;
 
@@ -114,13 +116,7 @@ export class InstanSegWebGPU {
     this.buf = {}; this._pool = new Map(); this._inUse = [];
   }
   static async create() {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("no WebGPU adapter");
-    const lim = adapter.limits;
-    const device = await adapter.requestDevice({ requiredLimits: {
-      maxBufferSize: lim.maxBufferSize, maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
-      maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup } });
-    return new InstanSegWebGPU(device);
+    return new InstanSegWebGPU(await requestDevice());
   }
   loadWeights(manifest, binArrayBuffer) {
     this.manifest = manifest; this.tensors = manifest.tensors; this.relu = manifest.relu;

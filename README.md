@@ -70,12 +70,15 @@ servers: they serve PyTorch checkpoints (wrong format) and aren't CORS-enabled. 
 
 ```
 src/           cellpose.js · stardist.js · instanseg.js   (the engines — MIT)
-demo/          index.html (landing) + per-model demos + sample images
+               device.js (adapter/limits) · conv-kernel.js (generated conv shader)
+src/profile/   measurement library — per-dispatch timing, empirical roofline, cost model
+demo/          index.html (landing) + per-model demos + profile.html + sample images
 weights/       <model>/{weights.bin, manifest.json, LICENSE, NOTICE, SHA256SUMS}
 tools/         export_*.py — regenerate the .bin weights from upstream checkpoints
+               convbench.mjs (conv variants) · profile.mjs (end-to-end profile)
 reference/     mini_*.py NumPy oracles + Jupyter walkthroughs + baseline_pytorch.py
 tests/         Deno/puppeteer fidelity harnesses + a minimal refdata subset
-docs/          GOTCHAS.md · ARCHITECTURE.md
+docs/          GOTCHAS.md · ARCHITECTURE.md · PHASE0.md · PHASE1.md (optimisation record)
 ```
 
 ## Reproducing the weights
@@ -100,8 +103,31 @@ committed so they run out of the box; regenerate the full set with `reference/ba
 
 ```bash
 deno run --unstable-webgpu --allow-read tests/cellpose_forward.mjs
+deno run --unstable-webgpu --allow-read tests/cellpose_flowqc.mjs   # GPU vs CPU flow QC
 deno run --allow-read tests/cellpose_tiling.mjs      # pure-logic tile/taper unit tests
 ```
+
+## Performance
+
+The Cellpose path was rebuilt around measurement rather than intuition: the conv kernel is
+~11× faster than its first version and the flow-consistency QC ~8×, for roughly **10×
+end-to-end**, with segmentation output unchanged (AP@0.5 = 1.000 against the PyTorch
+reference; the GPU flow QC differs from the CPU one on zero pixels).
+
+`docs/PHASE0.md` is the accounting that found where the time went — including three
+plausible-sounding culprits that measurably were *not* the problem. `docs/PHASE1.md` is
+what was done about it and why each constant in `src/conv-kernel.js` has the value it has.
+Both are worth reading before optimising anything here.
+
+```bash
+open http://localhost:8000/demo/profile.html                     # full profile (Chrome)
+deno run --unstable-webgpu --allow-read tools/convbench.mjs      # conv kernel variants
+```
+
+**Benchmark in Chrome, not Deno.** Deno's WebGPU on Metal writes a zero timestamp for the
+last compute pass of every encoder, so per-dispatch timing there is unsound; the tooling
+detects this and falls back to wall clock rather than reporting fiction, but variant
+ordering can still invert. Deno remains fully trustworthy for the correctness harnesses.
 
 ## Attribution & licensing
 

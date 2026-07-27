@@ -11,11 +11,21 @@ deno run --allow-read tests/cellpose_tiling.mjs
 
 # WGSL forward + dynamics vs PyTorch dumps (needs WebGPU)
 deno run --unstable-webgpu --allow-read tests/cellpose_forward.mjs
+
+# GPU flow-consistency QC against the CPU implementation (needs WebGPU)
+deno run --unstable-webgpu --allow-read tests/cellpose_flowqc.mjs
 deno run --unstable-webgpu --allow-read tests/stardist.mjs
 deno run --unstable-webgpu --allow-read tests/instanseg.mjs
 ```
 
 Each prints per-sample `max|Δ|`, mask counts, and AP@0.5, ending in `ALL OK` / `FAIL`.
+
+`cellpose_flowqc.mjs` is an *equivalence* harness rather than a reference one:
+`computeMasks()` reconstructs each mask's flow on the CPU and `computeMasksGPU()` diffuses
+every mask at once on the GPU, and the two must produce byte-identical label maps. It
+exists because `cellpose_forward.mjs` only exercises the CPU path, while `segmentImage()`
+uses the GPU one. It also reports how many masks the flow threshold actually rejected — a
+sample where it rejects nothing would pass no matter how wrong the reconstruction was.
 
 ## Reference data
 

@@ -17,6 +17,8 @@
 // is the cellpose tiled conv stripped of BN/skip/residual, with ReLU applied to
 // the conv *output* (StarDist is conv->ReLU, where cellpose folds BN pre-conv).
 
+import { requestDevice } from "./device.js";
+
 const N_RAYS = 32;
 const BLK = 8;          // output channels accumulated per workgroup (register block)
 const TS = 16;          // tile side
@@ -250,17 +252,7 @@ export class StarDistWebGPU {
   }
 
   static async create() {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("no WebGPU adapter");
-    const lim = adapter.limits;
-    const device = await adapter.requestDevice({
-      requiredLimits: {
-        maxBufferSize: lim.maxBufferSize,
-        maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
-        maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
-      }
-    });
-    return new StarDistWebGPU(device);
+    return new StarDistWebGPU(await requestDevice());
   }
 
   loadWeights(manifest, binArrayBuffer) {

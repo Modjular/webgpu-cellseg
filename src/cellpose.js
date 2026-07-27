@@ -17,97 +17,17 @@
 // Checkpoint cp001: naive shaders (one thread per output element), fresh
 // buffers per op, style readback mid-forward. Correctness first.
 
-// cp003/cp004: small-footprint shared-memory tiled conv (per input channel).
-// A 16×16 workgroup loads, per input channel, an 18×18 activated input tile +
-// this channel's BLK×K×K weight slab (~1.6KB shared, high occupancy) and all
-// 256 threads accumulate BLK output channels from shared memory.
-// (cp005's larger CHUNK tiling was reverted — it cut GPU occupancy.)
-const BLK = 8;
-const TS = 16;          // tile side
-const TW = TS + 2;      // tile side incl. halo (max pad = 1 for K∈{1,3})
-const CONV_WGSL = /* wgsl */`
-const BLK = ${BLK}u;
-const TS  = ${TS}u;
-const TW  = ${TW}u;
-// cp007: 'addv' is summed into the input before BN (skip connection); 'resid'
-// is summed into the conv output (residual), fusing the elementwise residual-add
-// passes into the conv that produces them (16 fewer dispatches per forward).
-struct P { H:u32, W:u32, Cin:u32, Cout:u32, K:u32, pad:u32, useRelu:u32, useAdd:u32,
-           useResid:u32, _p0:u32, _p1:u32, _p2:u32 };
-@group(0) @binding(0) var<uniform> p: P;
-@group(0) @binding(1) var<storage,read>       inp:   array<f32>;
-@group(0) @binding(2) var<storage,read>       w:     array<f32>;
-@group(0) @binding(3) var<storage,read>       b:     array<f32>;
-@group(0) @binding(4) var<storage,read>       scale: array<f32>;
-@group(0) @binding(5) var<storage,read>       shift: array<f32>;
-@group(0) @binding(6) var<storage,read>       addv:  array<f32>;
-@group(0) @binding(8) var<storage,read>       resid: array<f32>;
-@group(0) @binding(7) var<storage,read_write> outp:  array<f32>;
+// cp003/cp004: small-footprint shared-memory tiled conv, per input channel — a 16×16
+// workgroup loads an activated input tile plus a BLK×K×K weight slab into shared memory
+// and accumulates BLK output channels from there. (cp005's larger CHUNK tiling was
+// reverted; it cut occupancy.) Phase 1 kept that structure and fixed what was inside it.
+import { requestDevice } from "./device.js";
 
-var<workgroup> tile: array<f32, TW * TW>;   // activated input tile for current ci
-var<workgroup> ws:   array<f32, BLK * 9u>;  // weight slab for current ci
-
-@compute @workgroup_size(16,16,1)
-fn main(@builtin(workgroup_id) wg: vec3<u32>,
-        @builtin(local_invocation_id) lid: vec3<u32>) {
-  let coBase = wg.z * BLK;
-  let nco = min(BLK, p.Cout - coBase);
-  let HW = p.H * p.W;
-  let K = p.K; let pad = i32(p.pad); let KK = K * K;
-  let x = wg.x * TS + lid.x;
-  let y = wg.y * TS + lid.y;
-  let lt = lid.y * TS + lid.x;              // 0..255 flat thread id
-  let ox = i32(wg.x * TS) - pad;            // tile origin (global) x
-  let oy = i32(wg.y * TS) - pad;
-
-  var acc: array<f32, BLK>;
-  for (var j = 0u; j < BLK; j = j + 1u) { acc[j] = b[coBase + min(j, nco - 1u)]; }
-
-  let tileN = TW * TW;
-  let wN = nco * KK;
-  let stride = p.Cin * KK;
-  for (var ci = 0u; ci < p.Cin; ci = ci + 1u) {
-    let base = ci * HW;
-    let sc = scale[ci]; let sh = shift[ci];
-    for (var i = lt; i < tileN; i = i + TS * TS) {
-      let ty = i / TW; let tx = i % TW;
-      let gy = oy + i32(ty); let gx = ox + i32(tx);
-      var v = 0.0;
-      if (gy >= 0 && gy < i32(p.H) && gx >= 0 && gx < i32(p.W)) {
-        let idx = base + u32(gy) * p.W + u32(gx);
-        v = inp[idx];
-        if (p.useAdd == 1u) { v = v + addv[idx]; }
-        v = v * sc + sh;
-        if (p.useRelu == 1u) { v = max(v, 0.0); }
-      }
-      tile[i] = v;
-    }
-    let wbase = ci * KK;
-    for (var i = lt; i < wN; i = i + TS * TS) {
-      let j = i / KK; let k = i % KK;
-      ws[i] = w[(coBase + j) * stride + wbase + k];
-    }
-    workgroupBarrier();
-    for (var ky = 0u; ky < K; ky = ky + 1u) {
-      for (var kx = 0u; kx < K; kx = kx + 1u) {
-        let v = tile[(lid.y + ky) * TW + (lid.x + kx)];
-        let k = ky * K + kx;
-        for (var j = 0u; j < nco; j = j + 1u) {
-          acc[j] = acc[j] + v * ws[j * KK + k];
-        }
-      }
-    }
-    workgroupBarrier();
-  }
-  if (x < p.W && y < p.H) {
-    for (var j = 0u; j < nco; j = j + 1u) {
-      let oi = (coBase + j) * HW + y * p.W + x;
-      var o = acc[j];
-      if (p.useResid == 1u) { o = o + resid[oi]; }
-      outp[oi] = o;
-    }
-  }
-}`;
+// The conv kernel is generated per kernel size in src/conv-kernel.js. Phase 1 rebuilt it
+// — 10.9x faster, bit-identical output, 3.5% → 37% of this machine's roof — and that file
+// documents why each piece is shaped the way it is. src/profile/baseline-conv.js keeps
+// the version it replaced, as the benchmark's zero point.
+import { convWGSL, convDispatch } from "./conv-kernel.js";
 
 const ADD_WGSL = /* wgsl */`
 struct P { N:u32, nwgx:u32 };
@@ -202,6 +122,95 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
   pos[i] = py; pos[p.npts + i] = px;
 }`;
 
+// Flow-consistency QC, on the GPU.
+//
+// cellpose's remove_bad_flow_masks reconstructs each mask's flow field by running a
+// 9-point diffusion from a heat source at the mask's centre pixel, then compares the
+// gradient of that field against the network's predicted flow. Phase 1 measurement
+// (docs/PHASE1.md) found this single step at 95% of mask assembly and 72% of total wall
+// clock once the conv kernel got 11x faster — by far the largest remaining line item.
+//
+// The CPU version runs one mask at a time over its own bounding box. This runs every
+// mask at once over the whole image, which is equivalent given two details:
+//
+//   - **Neighbours are label-masked.** Per-mask, the diffusion field is sized to one
+//     bounding box and positions outside the mask footprint stay zero forever. Globally,
+//     a neighbouring pixel of a *different* mask holds that mask's heat, so it must be
+//     read as zero. Without this two adjacent cells bleed into each other.
+//   - **The source is folded into the read.** The CPU version does `T[med] += 1` at the
+//     top of each iteration, so the increment accumulates into the field. Adding 1 to the
+//     centre pixel's value as it is read is algebraically the same thing: the new centre
+//     value already contains the increment, and the next iteration adds another.
+//
+// Each mask runs its own iteration count (2*(ly+lx)), so masks freeze individually once
+// they reach it and the dispatch loop runs to the maximum. Freezing is per label and
+// neighbours are same-label by construction, so no mask ever reads a half-frozen one.
+const FLOWDIFF_WGSL = /* wgsl */`
+struct P { H:u32, W:u32, t:i32, _p:u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage,read>       labels: array<i32>;
+@group(0) @binding(2) var<storage,read>       niter:  array<i32>;
+@group(0) @binding(3) var<storage,read>       med:    array<i32>;
+@group(0) @binding(4) var<storage,read>       Tin:    array<f32>;
+@group(0) @binding(5) var<storage,read_write> Tout:   array<f32>;
+
+fn samp(x: i32, y: i32, l: i32, m: i32) -> f32 {
+  if (x < 0 || x >= i32(p.W) || y < 0 || y >= i32(p.H)) { return 0.0; }
+  let n = y * i32(p.W) + x;
+  if (labels[n] != l) { return 0.0; }   // a different mask's heat is not ours to read
+  var v = Tin[n];
+  if (n == m) { v = v + 1.0; }          // the heat source, folded into the read
+  return v;
+}
+
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= p.W || gid.y >= p.H) { return; }
+  let i = i32(gid.y * p.W + gid.x);
+  let l = labels[i];
+  if (l <= 0) { Tout[i] = 0.0; return; }
+  if (p.t >= niter[l]) { Tout[i] = Tin[i]; return; }
+  let x = i32(gid.x); let y = i32(gid.y);
+  let m = med[l];
+  // Summation order matches the CPU implementation tap for tap.
+  let s = samp(x, y, l, m)
+        + samp(x, y - 1, l, m) + samp(x, y + 1, l, m)
+        + samp(x - 1, y, l, m) + samp(x + 1, y, l, m)
+        + samp(x - 1, y - 1, l, m) + samp(x + 1, y - 1, l, m)
+        + samp(x - 1, y + 1, l, m) + samp(x + 1, y + 1, l, m);
+  Tout[i] = s / 9.0;
+}`;
+
+// Central difference of the diffused field, label-masked for the same reason as above.
+// Normalisation and the per-mask error stay on the CPU in f64: they are O(HW) and cheap,
+// and keeping them in double means the threshold comparison that decides how many masks
+// survive is not made on f32 sums.
+const FLOWGRAD_WGSL = /* wgsl */`
+struct P { H:u32, W:u32, t:i32, _p:u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage,read>       labels: array<i32>;
+@group(0) @binding(4) var<storage,read>       T:      array<f32>;
+@group(0) @binding(5) var<storage,read_write> grad:   array<f32>;
+
+fn g(x: i32, y: i32, l: i32) -> f32 {
+  if (x < 0 || x >= i32(p.W) || y < 0 || y >= i32(p.H)) { return 0.0; }
+  let n = y * i32(p.W) + x;
+  if (labels[n] != l) { return 0.0; }
+  return T[n];
+}
+
+@compute @workgroup_size(16,16,1)
+fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
+  if (gid.x >= p.W || gid.y >= p.H) { return; }
+  let i = i32(gid.y * p.W + gid.x);
+  let HW = i32(p.H * p.W);
+  let l = labels[i];
+  if (l <= 0) { grad[i] = 0.0; grad[HW + i] = 0.0; return; }
+  let x = i32(gid.x); let y = i32(gid.y);
+  grad[i]      = g(x, y + 1, l) - g(x, y - 1, l);
+  grad[HW + i] = g(x + 1, y, l) - g(x - 1, y, l);
+}`;
+
 // cp006: L2-normalize the style vector on the GPU (one workgroup reduction),
 // so the forward no longer stalls on a CPU readback mid-pass.
 const NORMSTYLE_WGSL = /* wgsl */`
@@ -251,7 +260,10 @@ export class CellposeWebGPU {
     const mk = (code) => d.createComputePipeline({
       layout: "auto", compute: { module: d.createShaderModule({ code }), entryPoint: "main" }
     });
-    this.pConv = mk(CONV_WGSL);
+    // One conv pipeline per kernel size. K is a compile-time constant in the shader so
+    // the taps unroll and the weight addressing folds — worth 1.4x on its own, and the
+    // network only ever uses K∈{1,3}, so it costs two pipelines.
+    this.pConvK = new Map([[1, mk(convWGSL(1))], [3, mk(convWGSL(3))]]);
     this.pAdd = mk(ADD_WGSL);
     this.pPool = mk(POOL_WGSL);
     this.pUp = mk(UP_WGSL);
@@ -259,23 +271,32 @@ export class CellposeWebGPU {
     this.pSteps = mk(STEPS_WGSL);
     this.pNorm = mk(NORMSTYLE_WGSL);
     this.pProj = mk(STYLEPROJ_WGSL);
+    // The flow-QC diffusion runs one dispatch per iteration inside a single encoder, and
+    // each needs its own `t`. An explicit layout with a dynamic offset lets all of them
+    // share one uniform buffer, which is why these two can't use `mk`'s auto layout.
+    this._flowLayout = d.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform", hasDynamicOffset: true } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      ],
+    });
+    const flowPl = d.createPipelineLayout({ bindGroupLayouts: [this._flowLayout] });
+    const mkFlow = (code) => d.createComputePipeline({
+      layout: flowPl, compute: { module: d.createShaderModule({ code }), entryPoint: "main" },
+    });
+    this.pFlowDiff = mkFlow(FLOWDIFF_WGSL);
+    this.pFlowGrad = mkFlow(FLOWGRAD_WGSL);
     this.buf = {};        // static weight buffers by name
     this._pool = new Map();  // free-list keyed by usage:size
     this._inUse = [];        // buffers acquired during the current forward
   }
 
   static async create() {
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
-    if (!adapter) throw new Error("no WebGPU adapter");
-    const lim = adapter.limits;
-    const device = await adapter.requestDevice({
-      requiredLimits: {
-        maxBufferSize: lim.maxBufferSize,
-        maxStorageBufferBindingSize: lim.maxStorageBufferBindingSize,
-        maxComputeInvocationsPerWorkgroup: lim.maxComputeInvocationsPerWorkgroup,
-      }
-    });
-    return new CellposeWebGPU(device);
+    return new CellposeWebGPU(await requestDevice());
   }
 
   loadWeights(manifest, binArrayBuffer) {
@@ -300,14 +321,16 @@ export class CellposeWebGPU {
   // the importing page lives). Pass a base URL — e.g. a HuggingFace or jsDelivr
   // URL — to load the weights from a CDN instead:
   //   const cp = await CellposeWebGPU.load("https://huggingface.co/<you>/cellpose-webgpu/resolve/main/cellpose-cyto3/");
+  // Pass `device` to build on an already-acquired GPUDevice instead of requesting a
+  // second one — how a host shares a single device across several models.
   static async load(baseURL = new URL("../weights/cellpose-cyto3/", import.meta.url).href,
-                    { manifest = "manifest.json", weights = "weights.bin" } = {}) {
+                    { manifest = "manifest.json", weights = "weights.bin", device = null } = {}) {
     const base = baseURL.endsWith("/") ? baseURL : baseURL + "/";
     const [mf, bin] = await Promise.all([
       fetch(base + manifest).then(r => r.json()),
       fetch(base + weights).then(r => r.arrayBuffer()),
     ]);
-    const inst = await this.create();
+    const inst = device ? new this(device) : await this.create();
     inst.loadWeights(mf, bin);
     return inst;
   }
@@ -316,6 +339,25 @@ export class CellposeWebGPU {
     const t = this.tensors[name];
     return this.blob.subarray(t.offset, t.offset + t.length);
   }
+
+  // Every command encoder this engine builds goes through here. The indirection exists
+  // so src/profile/timing.js can substitute a wrapper that adds timestamp queries to
+  // each compute pass without any op method learning about profiling — see the note in
+  // that file about keeping the engines near-frozen. Unprofiled, this is exactly
+  // `device.createCommandEncoder()`.
+  _mkEncoder(label) { return this.device.createCommandEncoder({ label }); }
+
+  // Stage accounting for the Phase 0 Amdahl split. `_stages` is null unless a profiling
+  // run sets it, so the unprofiled path pays for one null check per stage boundary and
+  // never calls the clock. The buckets deliberately separate CPU work from GPU waits:
+  // the coarse `timings` this returns alongside lumps the JS tile-blending in with the
+  // forward pass and the JS mask assembly in with the dynamics kernel, which is exactly
+  // the conflation Phase 0 exists to undo.
+  _stage(name, t0) {
+    if (!this._stages) return;
+    this._stages[name] = (this._stages[name] || 0) + (now() - t0);
+  }
+  _mark() { return this._stages ? now() : 0; }
 
   // ---- buffer helpers (cp004: pooled, reused across ops and forwards) ----
   // Buffers are acquired from a free-list keyed by (usage,size) and returned to
@@ -351,11 +393,17 @@ export class CellposeWebGPU {
   freeScratch() { this.releaseAll(); }
 
   // ---- ops (record into encoder) ----
-  conv(enc, { inBuf, outBuf, H, W, Cin, Cout, K, relu, addBuf, residBuf, wBuf, bBuf, scaleBuf, shiftBuf }) {
+  // `name` is carried only to label the compute pass. The label is what src/profile/
+  // parses back into a cost descriptor (FLOPs, ideal traffic, quantization waste), and
+  // it shows up in devtools' GPU capture besides — so the shape has to stay in sync
+  // with parseLabel() in src/profile/cost.js.
+  conv(enc, { inBuf, outBuf, H, W, Cin, Cout, K, relu, addBuf, residBuf, wBuf, bBuf, scaleBuf, shiftBuf, name }) {
     const uni = this.uniform([H, W, Cin, Cout, K, (K / 2) | 0, relu ? 1 : 0, addBuf ? 1 : 0,
       residBuf ? 1 : 0, 0, 0, 0]);
+    const pipe = this.pConvK.get(K);
+    if (!pipe) throw new Error(`no conv pipeline for K=${K} (built: ${[...this.pConvK.keys()]})`);
     const bg = this.device.createBindGroup({
-      layout: this.pConv.getBindGroupLayout(0), entries: [
+      layout: pipe.getBindGroupLayout(0), entries: [
         { binding: 0, resource: { buffer: uni } },
         { binding: 1, resource: { buffer: inBuf } },
         { binding: 2, resource: { buffer: wBuf } },
@@ -367,9 +415,14 @@ export class CellposeWebGPU {
         { binding: 7, resource: { buffer: outBuf } },
       ]
     });
-    const pass = enc.beginComputePass();
-    pass.setPipeline(this.pConv); pass.setBindGroup(0, bg);
-    pass.dispatchWorkgroups(Math.ceil(W / 16), Math.ceil(H / 16), Math.ceil(Cout / BLK));
+    const flags = (relu ? "|relu" : "") + (addBuf ? "|add" : "") + (residBuf ? "|resid" : "");
+    const pass = enc.beginComputePass({
+      label: `conv|${name || "?"}|${Cin}->${Cout}|${H}x${W}|k${K}${flags}` });
+    pass.setPipeline(pipe); pass.setBindGroup(0, bg);
+    // Each thread now covers an RBY x RBX block of output pixels, so the grid shrinks by
+    // that factor — convDispatch owns the arithmetic so it cannot drift from the shader.
+    const [gx, gy, gz] = convDispatch(H, W, Cout);
+    pass.dispatchWorkgroups(gx, gy, gz);
     pass.end();
   }
   add(enc, aBuf, bBuf, outBuf, N) {
@@ -384,7 +437,7 @@ export class CellposeWebGPU {
         { binding: 3, resource: { buffer: outBuf } },
       ]
     });
-    const pass = enc.beginComputePass();
+    const pass = enc.beginComputePass({ label: `add|N${N}` });
     pass.setPipeline(this.pAdd); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(nwgx, nwgy); pass.end();
   }
@@ -398,7 +451,7 @@ export class CellposeWebGPU {
         { binding: 2, resource: { buffer: outBuf } },
       ]
     });
-    const pass = enc.beginComputePass();
+    const pass = enc.beginComputePass({ label: `pool|${Hi}x${Wi}->${Ho}x${Wo}|C${C}` });
     pass.setPipeline(this.pPool); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(Math.ceil(Wo / 16), Math.ceil(Ho / 16), C); pass.end();
     return [Ho, Wo];
@@ -413,7 +466,7 @@ export class CellposeWebGPU {
         { binding: 2, resource: { buffer: outBuf } },
       ]
     });
-    const pass = enc.beginComputePass();
+    const pass = enc.beginComputePass({ label: `up|${Hi}x${Wi}->${Ho}x${Wo}|C${C}` });
     pass.setPipeline(this.pUp); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(Math.ceil(Wo / 16), Math.ceil(Ho / 16), C); pass.end();
     return [Ho, Wo];
@@ -427,7 +480,7 @@ export class CellposeWebGPU {
         { binding: 2, resource: { buffer: outBuf } },
       ]
     });
-    const pass = enc.beginComputePass();
+    const pass = enc.beginComputePass({ label: `gap|${H}x${W}|C${C}` });
     pass.setPipeline(this.pGap); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(Math.ceil(C / 64)); pass.end();
   }
@@ -436,7 +489,7 @@ export class CellposeWebGPU {
   // addBuf sums into the input (pre-BN); residBuf sums into the output (residual).
   bc(enc, name, inBuf, outBuf, H, W, Cin, Cout, K, relu, addBuf, shiftBufOverride, residBuf) {
     this.conv(enc, {
-      inBuf, outBuf, H, W, Cin, Cout, K, relu, addBuf, residBuf,
+      inBuf, outBuf, H, W, Cin, Cout, K, relu, addBuf, residBuf, name,
       wBuf: this.buf[name + ".w"], bBuf: this.buf[name + ".b"],
       scaleBuf: this.buf[name + ".scale"],
       shiftBuf: shiftBufOverride || this.buf[name + ".shift"],
@@ -461,7 +514,7 @@ export class CellposeWebGPU {
   normStyle(enc, rawBuf, outBuf) {
     const bg = this.device.createBindGroup({ layout: this.pNorm.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: rawBuf } }, { binding: 1, resource: { buffer: outBuf } }] });
-    const pass = enc.beginComputePass();
+    const pass = enc.beginComputePass({ label: "normstyle|C256" });
     pass.setPipeline(this.pNorm); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(1); pass.end();
   }
@@ -477,7 +530,7 @@ export class CellposeWebGPU {
       { binding: 4, resource: { buffer: this.buf[name + ".scale"] } },
       { binding: 5, resource: { buffer: this.buf[name + ".shift"] } },
       { binding: 6, resource: { buffer: eff } }] });
-    const pass = enc.beginComputePass();
+    const pass = enc.beginComputePass({ label: `styleproj|${name}|C${Cout}` });
     pass.setPipeline(this.pProj); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(Math.ceil(Cout / 64)); pass.end();
     return eff;
@@ -508,7 +561,7 @@ export class CellposeWebGPU {
 
     // cp006: whole forward in a SINGLE command encoder — encoder, GPU style
     // (normalize + projections), decoder, output head. No mid-forward CPU stall.
-    const enc = d.createCommandEncoder();
+    const enc = this._mkEncoder("forward");
     const xd = [];
     let y = inBuf, hy = H, wy = W;
     for (let n = 0; n < 4; n++) {
@@ -560,6 +613,7 @@ export class CellposeWebGPU {
   //   ch0/ch1: Float32Array [Lyr*Lxr] normalized+resized channels (ch1 may be null).
   //   returns Float32Array [3*Lyr*Lxr] = (dY,dX,cellprob) at the working resolution.
   async runNet(ch0, ch1, Lyr, Lxr) {
+    const mPad = this._mark();
     const [ypad1, ypad2, xpad1, xpad2] = getPadYX(Lyr, Lxr, 16, 1);
     const Ly = Lyr + ypad1 + ypad2, Lx = Lxr + xpad1 + xpad2;
     // zero-padded 2-channel image [2,Ly,Lx] (cellpose pads with mode="constant")
@@ -573,10 +627,13 @@ export class CellposeWebGPU {
         for (let x = 0; x < Lxr; x++) img[d + x] = src[s + x];
       }
     }
+    this._stage("pad", mPad);
     const { ny, nx, bsizeY, bsizeX, ystart, xstart } = tileGrid(Ly, Lx, 224, 0.1);
     const TP = bsizeY * bsizeX;
+    if (this._stages) this._stages.tiles = ny * nx;
     // extract one [2,bsizeY,bsizeX] tile at padded-image corner (y0,x0)
     const extract = (y0, x0) => {
+      const m = this._mark();
       const tile = new Float32Array(2 * TP);
       for (let c = 0; c < 2; c++) {
         const so = c * Ly * Lx, to = c * TP;
@@ -585,10 +642,12 @@ export class CellposeWebGPU {
           for (let tx = 0; tx < bsizeX; tx++) tile[t + tx] = img[s + tx];
         }
       }
+      this._stage("tile_extract", m);
       return tile;
     };
     // crop a padded [3,Ly,Lx] field back to [3,Lyr,Lxr]
     const cropPad = (yf) => {
+      const m = this._mark();
       const out = new Float32Array(3 * Lyr * Lxr);
       for (let c = 0; c < 3; c++) {
         const so = c * Ly * Lx, to = c * Lyr * Lxr;
@@ -597,12 +656,16 @@ export class CellposeWebGPU {
           for (let x = 0; x < Lxr; x++) out[t + x] = yf[s + x];
         }
       }
+      this._stage("crop", m);
       return out;
     };
     // single tile spans the whole padded image; average_tiles' taper mask cancels
     // (yf = y[0]*mask/mask), so this is a plain forward — today's fast path.
     if (ny === 1 && nx === 1) {
-      const { output } = await this.forwardFromInput(extract(ystart[0], xstart[0]), bsizeY, bsizeX);
+      const tile = extract(ystart[0], xstart[0]);
+      const mFwd = this._mark();
+      const { output } = await this.forwardFromInput(tile, bsizeY, bsizeX);
+      this._stage("forward_wait", mFwd);
       return cropPad(output);
     }
     // multi-tile: weighted accumulate with the taper mask, then divide by weight.
@@ -612,7 +675,15 @@ export class CellposeWebGPU {
     for (let j = 0; j < ny; j++) {
       for (let i = 0; i < nx; i++) {
         const y0 = ystart[j], x0 = xstart[i];
-        const { output } = await this.forwardFromInput(extract(y0, x0), bsizeY, bsizeX);
+        const tile = extract(y0, x0);
+        // Each tile is a full submit + mapAsync round-trip: the pipeline drains between
+        // tiles even though tiles are entirely independent of one another. Measuring
+        // this wait against the GPU-busy time inside it is how Phase 0 prices the
+        // per-tile serialization.
+        const mFwd = this._mark();
+        const { output } = await this.forwardFromInput(tile, bsizeY, bsizeX);
+        this._stage("forward_wait", mFwd);
+        const mBlend = this._mark();
         for (let ty = 0; ty < bsizeY; ty++) {
           for (let tx = 0; tx < bsizeX; tx++) {
             const m = mask[ty * bsizeX + tx];
@@ -624,8 +695,10 @@ export class CellposeWebGPU {
             acc[2 * Ly * Lx + p] += output[2 * TP + ti] * m;
           }
         }
+        this._stage("blend", mBlend);
       }
     }
+    const mNorm = this._mark();
     const yf = new Float32Array(3 * Ly * Lx);
     const N = Ly * Lx;
     for (let p = 0; p < N; p++) {
@@ -634,6 +707,7 @@ export class CellposeWebGPU {
       yf[N + p] = acc[N + p] * inv;
       yf[2 * N + p] = acc[2 * N + p] * inv;
     }
+    this._stage("blend", mNorm);
     return cropPad(yf);
   }
 
@@ -654,7 +728,9 @@ export class CellposeWebGPU {
   // GPU Euler integration variant (cp005). Same result as computeMasks.
   async computeMasksGPU(dP, cellprob, H, W, opts = {}) {
     const { cellprob_threshold = 0.0, niter = 200, min_size = 15, rpad = 20, flow_threshold = 0.4 } = opts;
+    const mSetup = this._mark();
     const { ys, xs, dy, dx } = this._dynamicsSetup(dP, cellprob, H, W, cellprob_threshold);
+    this._stage("dyn_setup", mSetup);
     const npts = ys.length;
     if (npts === 0) return new Int32Array(H * W);
     const d = this.device, HW = H * W;
@@ -672,8 +748,10 @@ export class CellposeWebGPU {
     const bg = d.createBindGroup({ layout: this.pSteps.getBindGroupLayout(0), entries: [
       { binding: 0, resource: { buffer: uni } }, { binding: 1, resource: { buffer: dyBuf } },
       { binding: 2, resource: { buffer: dxBuf } }, { binding: 3, resource: { buffer: posBuf } }] });
-    const enc = d.createCommandEncoder();
-    const pass = enc.beginComputePass(); pass.setPipeline(this.pSteps); pass.setBindGroup(0, bg);
+    const mDyn = this._mark();
+    const enc = this._mkEncoder("dynamics");
+    const pass = enc.beginComputePass({ label: `dynamics|npts${npts}|niter${niter}` });
+    pass.setPipeline(this.pSteps); pass.setBindGroup(0, bg);
     pass.dispatchWorkgroups(nwgx, nwgy); pass.end();
     const rb = d.createBuffer({ size: 2 * npts * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyBufferToBuffer(posBuf, 0, rb, 0, 2 * npts * 4);
@@ -681,8 +759,13 @@ export class CellposeWebGPU {
     await rb.mapAsync(GPUMapMode.READ);
     const posF = new Float32Array(rb.getMappedRange().slice(0)); rb.unmap();
     dyBuf.destroy(); dxBuf.destroy(); posBuf.destroy(); uni.destroy(); rb.destroy();
+    this._stage("dyn_wait", mDyn);
     const py = posF.subarray(0, npts), px = posF.subarray(npts, 2 * npts);
-    return this._getMasks(py, px, ys, xs, dy, dx, H, W, rpad, min_size, flow_threshold);
+    const mMasks = this._mark();
+    const raw = this._getMasks(py, px, ys, xs, dy, dx, H, W, rpad, min_size, flow_threshold);
+    const labels = await this._filterMasksGPU(raw, dy, dx, H, W, min_size, flow_threshold);
+    this._stage("getmasks", mMasks);
+    return labels;
   }
 
   computeMasks(dP, cellprob, H, W, opts = {}) {
@@ -713,10 +796,12 @@ export class CellposeWebGPU {
         py[i] = ny; px[i] = nx;
       }
     }
-    return this._getMasks(py, px, ys, xs, dy, dx, H, W, rpad, min_size, flow_threshold);
+    const raw = this._getMasks(py, px, ys, xs, dy, dx, H, W, rpad, min_size, flow_threshold);
+    return this._filterMasks(raw, dy, dx, H, W, min_size, flow_threshold);
   }
 
   _getMasks(py, px, ys, xs, dy, dx, H, W, rpad, min_size, flow_threshold) {
+    const mHist = this._mark();
     const npts = py.length;
     const Hh = H + 2 * rpad, Ww = W + 2 * rpad;
     // integer final positions (trunc) + rpad, clamp to [0, shape0+rpad-1]
@@ -730,7 +815,9 @@ export class CellposeWebGPU {
     // histogram
     const h1 = new Int32Array(Hh * Ww);
     for (let i = 0; i < npts; i++) h1[pty[i] * Ww + ptx[i]]++;
+    this._stage("gm_hist", mHist);
     // local maxima in 5x5 with count>10
+    const mSeeds = this._mark();
     const seeds = [];
     for (let y = 0; y < Hh; y++) for (let x = 0; x < Ww; x++) {
       const c = h1[y * Ww + x];
@@ -747,8 +834,10 @@ export class CellposeWebGPU {
     }
     if (seeds.length === 0) return new Int32Array(H * W);
     seeds.sort((a, b) => a[2] - b[2]); // ascending count; later (bigger) wins overlaps
+    this._stage("gm_seeds", mSeeds);
 
     // grow each seed within 11x11 window: 5 iters dilate(3x3) & (h_slc>2)
+    const mGrow = this._mark();
     const M1 = new Int32Array(Hh * Ww);
     for (let k = 0; k < seeds.length; k++) {
       const [sy, sx] = seeds[k];
@@ -779,12 +868,15 @@ export class CellposeWebGPU {
         }
       }
     }
+    this._stage("gm_grow", mGrow);
     // assign each pixel the label of its final bucket
     const labels = new Int32Array(H * W);
     for (let i = 0; i < npts; i++) {
       labels[ys[i] * W + xs[i]] = M1[pty[i] * Ww + ptx[i]];
     }
-    return this._filterMasks(labels, dy, dx, H, W, min_size, flow_threshold);
+    // The caller filters: the GPU flow-QC path is async and the plain computeMasks()
+    // entry point must stay synchronous, so _getMasks stops at the raw label map.
+    return labels;
   }
 
   // Port of cellpose masks_to_flows_cpu: for each mask, run a 9-point diffusion
@@ -822,16 +914,25 @@ export class CellposeWebGPU {
       const niter = 2 * (ly + lx);
       const T = new Float64Array(ly * lx);
       const nxt = new Float64Array(n);
+      // Flat index per mask pixel, computed once instead of rebuilt from (Y,X) on every
+      // one of the ~2*(ly+lx) iterations. The nine taps then come off one base by
+      // addition rather than three multiplies plus two typed-array loads per pixel.
+      // The summation order is unchanged, so this is bit-identical — which matters,
+      // because the result feeds a threshold comparison that decides how many masks
+      // survive (173 of 190 on the reference image).
+      const idx = new Int32Array(n);
+      for (let k = 0; k < n; k++) idx[k] = Y[k] * lx + X[k];
+      const medIdx = ymed * lx + xmed;
       for (let t = 0; t < niter; t++) {
-        T[ymed * lx + xmed] += 1;
+        T[medIdx] += 1;
         for (let k = 0; k < n; k++) {
-          const yl = Y[k], xl = X[k];
-          nxt[k] = (T[yl * lx + xl] + T[(yl - 1) * lx + xl] + T[(yl + 1) * lx + xl] +
-                    T[yl * lx + xl - 1] + T[yl * lx + xl + 1] +
-                    T[(yl - 1) * lx + xl - 1] + T[(yl - 1) * lx + xl + 1] +
-                    T[(yl + 1) * lx + xl - 1] + T[(yl + 1) * lx + xl + 1]) / 9;
+          const c = idx[k], u = c - lx, v = c + lx;
+          nxt[k] = (T[c] + T[u] + T[v] +
+                    T[c - 1] + T[c + 1] +
+                    T[u - 1] + T[u + 1] +
+                    T[v - 1] + T[v + 1]) / 9;
         }
-        for (let k = 0; k < n; k++) T[Y[k] * lx + X[k]] = nxt[k];
+        for (let k = 0; k < n; k++) T[idx[k]] = nxt[k];
       }
       for (let k = 0; k < n; k++) {
         const yl = Y[k], xl = X[k];
@@ -859,21 +960,169 @@ export class CellposeWebGPU {
     return merr;
   }
 
+  /**
+   * GPU flow-consistency QC. Same contract as _maskFlowErrors: returns per-label mean
+   * squared error between the reconstructed and predicted flow.
+   *
+   * The diffusion runs on the GPU (see FLOWDIFF_WGSL for why the global formulation is
+   * equivalent to the per-mask one); the normalisation and the per-mask error stay on
+   * the CPU in f64, so the comparison against flow_threshold — which decides how many
+   * masks survive — is not made on f32 sums.
+   */
+  async _maskFlowErrorsGPU(labels, dy, dx, H, W, maxLabel, keep) {
+    const d = this.device, HW = H * W;
+    // Bounding boxes, centroids and the centre pixel, in three linear scans instead of
+    // one pass per mask. Local and global coordinates differ by a per-mask constant, so
+    // the centroid argmin is the same either way — and raster order matches the CPU's
+    // iteration order, which matters only for tie-breaking.
+    const minY = new Int32Array(maxLabel + 1).fill(H), maxY = new Int32Array(maxLabel + 1).fill(-1);
+    const minX = new Int32Array(maxLabel + 1).fill(W), maxX = new Int32Array(maxLabel + 1).fill(-1);
+    const ysum = new Float64Array(maxLabel + 1), xsum = new Float64Array(maxLabel + 1);
+    const cnt = new Int32Array(maxLabel + 1);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const l = labels[y * W + x];
+      if (l === 0) continue;
+      if (y < minY[l]) minY[l] = y; if (y > maxY[l]) maxY[l] = y;
+      if (x < minX[l]) minX[l] = x; if (x > maxX[l]) maxX[l] = x;
+      ysum[l] += y; xsum[l] += x; cnt[l]++;
+    }
+    const best = new Float64Array(maxLabel + 1).fill(Infinity);
+    const med = new Int32Array(maxLabel + 1).fill(-1);
+    const niter = new Int32Array(maxLabel + 1);
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      const i = y * W + x, l = labels[i];
+      if (l === 0 || !keep[l] || cnt[l] === 0) continue;
+      const dd = (x - xsum[l] / cnt[l]) ** 2 + (y - ysum[l] / cnt[l]) ** 2;
+      if (dd < best[l]) { best[l] = dd; med[l] = i; }   // strict <: first in raster order wins
+    }
+    let maxNiter = 0;
+    for (let l = 1; l <= maxLabel; l++) {
+      if (!keep[l] || maxY[l] < 0) continue;
+      const ly = (maxY[l] - minY[l] + 1) + 2, lx = (maxX[l] - minX[l] + 1) + 2;
+      niter[l] = 2 * (ly + lx);
+      if (niter[l] > maxNiter) maxNiter = niter[l];
+    }
+    if (maxNiter === 0) return new Float64Array(maxLabel + 1);
+
+    const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+    const labBuf = d.createBuffer({ size: HW * 4, usage: S });
+    const nitBuf = d.createBuffer({ size: Math.max(256, (maxLabel + 1) * 4), usage: S });
+    const medBuf = d.createBuffer({ size: Math.max(256, (maxLabel + 1) * 4), usage: S });
+    const T0 = d.createBuffer({ size: HW * 4, usage: S });
+    const T1 = d.createBuffer({ size: HW * 4, usage: S });
+    const gradBuf = d.createBuffer({ size: 2 * HW * 4, usage: S });
+    d.queue.writeBuffer(labBuf, 0, labels instanceof Int32Array ? labels : new Int32Array(labels));
+    d.queue.writeBuffer(nitBuf, 0, niter);
+    d.queue.writeBuffer(medBuf, 0, med);
+    d.queue.writeBuffer(T0, 0, new Float32Array(HW));
+
+    // One uniform buffer holding every iteration's `t`, addressed by dynamic offset.
+    const align = d.limits.minUniformBufferOffsetAlignment || 256;
+    const uni = d.createBuffer({
+      size: align * maxNiter, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const slot = new Uint32Array(align / 4);   // struct P { H:u32, W:u32, t:i32, _p:u32 }
+    for (let t = 0; t < maxNiter; t++) {
+      slot[0] = H; slot[1] = W; slot[2] = t; slot[3] = 0;
+      d.queue.writeBuffer(uni, t * align, slot);
+    }
+
+    const bg = (Tin, Tout) => d.createBindGroup({
+      layout: this._flowLayout, entries: [
+        { binding: 0, resource: { buffer: uni, size: 16 } },
+        { binding: 1, resource: { buffer: labBuf } },
+        { binding: 2, resource: { buffer: nitBuf } },
+        { binding: 3, resource: { buffer: medBuf } },
+        { binding: 4, resource: { buffer: Tin } },
+        { binding: 5, resource: { buffer: Tout } },
+      ],
+    });
+    const bgA = bg(T0, T1), bgB = bg(T1, T0);
+    const gx = Math.ceil(W / 16), gy = Math.ceil(H / 16);
+
+    const enc = this._mkEncoder("flowqc");
+    for (let t = 0; t < maxNiter; t++) {
+      const pass = enc.beginComputePass({ label: `flowdiff|${H}x${W}|t${t}` });
+      pass.setPipeline(this.pFlowDiff);
+      pass.setBindGroup(0, t % 2 === 0 ? bgA : bgB, [t * align]);
+      pass.dispatchWorkgroups(gx, gy); pass.end();
+    }
+    // Iteration t writes T1 for even t, T0 for odd — so the last write lands in T1 when
+    // maxNiter is odd and T0 when it is even.
+    const finalT = (maxNiter % 2 === 1) ? T1 : T0;
+    const gpass = enc.beginComputePass({ label: `flowgrad|${H}x${W}|n${maxNiter}` });
+    gpass.setPipeline(this.pFlowGrad);
+    gpass.setBindGroup(0, bg(finalT, gradBuf), [0]);
+    gpass.dispatchWorkgroups(gx, gy); gpass.end();
+
+    const rb = d.createBuffer({ size: 2 * HW * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+    enc.copyBufferToBuffer(gradBuf, 0, rb, 0, 2 * HW * 4);
+    d.queue.submit([enc.finish()]);
+    await rb.mapAsync(GPUMapMode.READ);
+    const grad = new Float32Array(rb.getMappedRange().slice(0));
+    rb.unmap();
+    for (const b of [labBuf, nitBuf, medBuf, T0, T1, gradBuf, uni, rb]) b.destroy();
+
+    // Unit-normalise per pixel and accumulate the per-mask error, both in f64 to match
+    // the CPU path exactly at the point where the threshold is applied.
+    const errSum = new Float64Array(maxLabel + 1), errN = new Int32Array(maxLabel + 1);
+    for (let i = 0; i < HW; i++) {
+      const l = labels[i];
+      if (l === 0 || !keep[l]) continue;
+      const gdy = grad[i], gdx = grad[HW + i];
+      const mag = Math.sqrt(gdy * gdy + gdx * gdx) + 1e-60;
+      const ed = gdy / mag - dy[i], ex = gdx / mag - dx[i];
+      errSum[l] += ed * ed + ex * ex; errN[l]++;
+    }
+    const merr = new Float64Array(maxLabel + 1);
+    for (let l = 1; l <= maxLabel; l++) if (errN[l] > 0) merr[l] = errSum[l] / errN[l];
+    return merr;
+  }
+
   // Port of cellpose compute_masks post-processing order: remove oversized masks (>40%
   // of image area), then flow-consistency QC (remove_bad_flow_masks), then min-size —
   // matching get_masks_torch -> remove_bad_flow_masks -> fill_holes_and_remove_small_masks.
-  _filterMasks(labels, dy, dx, H, W, min_size, flow_threshold) {
+  // Everything before the flow-QC step, which is where the two paths diverge. Returns
+  // the state the QC needs, or null when there is nothing left to filter.
+  _filterPrepare(labels, H, W) {
     const maxLabel = labels.reduce((m, v) => v > m ? v : m, 0);
-    if (maxLabel === 0) return labels;
+    if (maxLabel === 0) return null;
     const counts = new Int32Array(maxLabel + 1);
     for (let i = 0; i < labels.length; i++) counts[labels[i]]++;
     const big = 0.4 * H * W;
     const keep = new Uint8Array(maxLabel + 1);
     for (let l = 1; l <= maxLabel; l++) keep[l] = (counts[l] > 0 && counts[l] <= big) ? 1 : 0;
     for (let i = 0; i < labels.length; i++) { const l = labels[i]; if (l && !keep[l]) labels[i] = 0; }
+    return { maxLabel, counts, keep };
+  }
 
+  // Synchronous filtering with the CPU flow reconstruction. Kept for computeMasks(),
+  // the non-GPU entry point, and as the reference the GPU path is checked against.
+  _filterMasks(labels, dy, dx, H, W, min_size, flow_threshold) {
+    const prep = this._filterPrepare(labels, H, W);
+    if (!prep) return labels;
+    const { maxLabel, keep } = prep;
+    const merr = (flow_threshold != null && flow_threshold > 0)
+      ? this._maskFlowErrors(labels, dy, dx, H, W, maxLabel, keep) : null;
+    return this._filterFinish(labels, prep, min_size, flow_threshold, merr);
+  }
+
+  // Same, with the diffusion on the GPU.
+  async _filterMasksGPU(labels, dy, dx, H, W, min_size, flow_threshold) {
+    const prep = this._filterPrepare(labels, H, W);
+    if (!prep) return labels;
+    const { maxLabel, keep } = prep;
+    let merr = null;
     if (flow_threshold != null && flow_threshold > 0) {
-      const merr = this._maskFlowErrors(labels, dy, dx, H, W, maxLabel, keep);
+      const mFlow = this._mark();
+      merr = await this._maskFlowErrorsGPU(labels, dy, dx, H, W, maxLabel, keep);
+      this._stage("gm_flowerr", mFlow);
+    }
+    return this._filterFinish(labels, prep, min_size, flow_threshold, merr);
+  }
+
+  _filterFinish(labels, { maxLabel, counts, keep }, min_size, flow_threshold, merr) {
+    if (merr) {
       for (let l = 1; l <= maxLabel; l++) if (keep[l] && merr[l] > flow_threshold) keep[l] = 0;
       for (let i = 0; i < labels.length; i++) { const l = labels[i]; if (l && !keep[l]) labels[i] = 0; }
     }
@@ -896,6 +1145,9 @@ export class CellposeWebGPU {
   // — mirrors cellpose's default resample=True eval() path.
   async segmentImage(gray, H, W, opts = {}) {
     const t0 = now();
+    // Phase 0 stage accounting. Set `_stages` to {} before calling to have the finer
+    // CPU/GPU/stall split filled in; leave it null and nothing here costs anything.
+    if (this._stages) for (const k of Object.keys(this._stages)) delete this._stages[k];
     const { diameter = 30, chan2 = null } = opts;
     const rescale = 30 / (diameter > 0 ? diameter : 30);
     // `gray` is the channel to segment (cytoplasm); `opts.chan2` is the optional
@@ -934,6 +1186,7 @@ export class CellposeWebGPU {
     const niter = Math.max(1, Math.round((opts.niter ?? 200) / effRescale));
     const dynOpts = { ...opts, niter };
     const t1 = now();
+    this._stage("preprocess", t0);
     // tiled forward, matching cellpose core.run_net exactly (pad → 224-tiles →
     // per-tile style → taper-blend → crop). Returns [3,H2,W2] = (dY,dX,cellprob).
     const output = await this.runNet(ch0, ch1, H2, W2);
@@ -942,6 +1195,7 @@ export class CellposeWebGPU {
     const dP2 = output.subarray(0, 2 * H2 * W2);
     const cellprob2 = output.subarray(2 * H2 * W2, 3 * H2 * W2);
     // resize flow + cellprob back to the original (H,W) resolution, then run dynamics there
+    const mResize = this._mark();
     let dP = dP2, cellprob = cellprob2;
     if (H2 !== H || W2 !== W) {
       dP = new Float32Array(2 * H * W);
@@ -949,10 +1203,14 @@ export class CellposeWebGPU {
       dP.set(resizeBilinear(dP2.subarray(H2 * W2, 2 * H2 * W2), H2, W2, H, W), H * W);
       cellprob = resizeBilinear(cellprob2, H2, W2, H, W);
     }
+    this._stage("resize_back", mResize);
     const labels = await this.computeMasksGPU(dP, cellprob, H, W, dynOpts);
     const t3 = now();
-    return { labels, output, dP, cellprob, H, W,
-      timings: { preprocess: t1 - t0, forward: t2 - t1, dynamics: t3 - t2, total: t3 - t0 } };
+    // The three coarse buckets stay exactly as they were — registry.js and the Python
+    // shims read them — with the finer split carried alongside when profiling is on.
+    const timings = { preprocess: t1 - t0, forward: t2 - t1, dynamics: t3 - t2, total: t3 - t0 };
+    if (this._stages) timings.stages = { ...this._stages };
+    return { labels, output, dP, cellprob, H, W, timings };
   }
 }
 
