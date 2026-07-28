@@ -57,7 +57,11 @@ export function parseLabel(label) {
     }
     if (kind === "flowdiff" || kind === "flowgrad") {
       const [h, w] = p[1].split("x").map(Number);
-      return { kind, H: h, W: w };
+      // `n{count}` is the packed kept-mask-pixel count the dispatch actually covers —
+      // it, not H*W, is the real amount of work since the dispatch was bounded to it.
+      const nSeg = p.find((s) => s[0] === "n" && /^n\d+$/.test(s));
+      const count = nSeg ? num(nSeg, "n") : h * w;
+      return { kind, H: h, W: w, count };
     }
     if (kind === "normstyle") return { kind, C: num(p[1], "C") };
     if (kind === "styleproj") return { kind, name: p[1], Cout: num(p[2], "C"), S: 256 };
@@ -134,20 +138,21 @@ export function costOf(d) {
                note: "one thread per channel" };
     }
     case "flowdiff": {
-      // One iteration of the label-masked 9-point diffusion over the whole image.
-      // Compulsory traffic is one read of the field, one of the label map and one write;
-      // what the kernel actually requests is nine of each, which the cache mostly
-      // absorbs — the gap between the two is the amplification column.
-      const { H, W } = d, n = H * W;
+      // One iteration of the label-masked 9-point diffusion, dispatched over the packed
+      // kept-mask-pixel count, not H*W — background and rejected masks are never in the
+      // dispatch at all now. Compulsory traffic is one read of the field, one of the
+      // label map and one write; what the kernel actually requests is nine of each, which
+      // the cache mostly absorbs — the gap between the two is the amplification column.
+      const n = d.count;
       const cio = F32 * 3 * n;
       return { flops: 10 * n, macs: 0, cioIdeal: cio, cioRequested: F32 * 19 * n,
-               tileWaste: 0, note: "stencil; background pixels exit early" };
+               tileWaste: 0, note: "stencil over packed mask pixels" };
     }
     case "flowgrad": {
-      const { H, W } = d, n = H * W;
+      const n = d.count;
       const cio = F32 * 4 * n;
       return { flops: 2 * n, macs: 0, cioIdeal: cio, cioRequested: F32 * 10 * n,
-               tileWaste: 0, note: "central difference, label-masked" };
+               tileWaste: 0, note: "central difference over packed mask pixels" };
     }
     case "normstyle": {
       const cio = F32 * (2 * d.C);

@@ -134,6 +134,7 @@ python3 -m http.server 8000          # for the demo pages
 deno run --allow-read                 tests/cellpose_tiling.mjs
 deno run --unstable-webgpu --allow-read tests/cellpose_forward.mjs
 deno run --unstable-webgpu --allow-read tests/cellpose_flowqc.mjs
+deno run --unstable-webgpu --allow-read tests/cellpose_f16.mjs   # IoU/count vs reference, not shipped
 deno run --unstable-webgpu --allow-read tests/stardist.mjs
 deno run --unstable-webgpu --allow-read tests/instanseg.mjs
 
@@ -142,6 +143,9 @@ deno run --unstable-webgpu --allow-read --allow-write tools/convbench.mjs --shap
 
 # the real profile
 open http://localhost:8000/demo/profile.html
+
+# subgroup-matrix prototype (docs/PHASE2.md) — correctness + throughput, Chrome only
+open http://localhost:8000/demo/subgroup_matrix_gemm.html
 ```
 
 `demo/profile.html` takes ~10 s: it measures the machine's roofs empirically (compute,
@@ -158,13 +162,40 @@ the engines or the profiling tooling).
 
 ## What's next, cheapest first
 
-1. **`subgroup-matrix`** (Metal simdgroup matmul) — available on this adapter, unused.
-   The conv is at ~40% of roof and parameter tuning is exhausted, so this is the only
-   substantial lever left on it. Real rewrite: implicit GEMM with im2col in shared memory.
-2. **The flow-QC kernel dispatches over the whole image** regardless of mask coverage,
-   which is why the small-mask case gained ~1.8× against the large-mask case's 8.2×.
-   Bound the dispatch to the union of mask bounding boxes, or compact mask pixels.
-3. **Re-test f16** properly (see above).
+Items 1-3 below (the top three from the previous handoff) now have real progress — see
+each for what actually landed vs. what's still open.
+
+1. ~~Bound the flow-QC dispatch~~ **Done.** `_maskFlowErrorsGPU` (src/cellpose.js) now
+   builds a packed list of kept-mask pixel indices and dispatches the diffusion/gradient
+   passes over that instead of the whole image every iteration. Bit-exact — verified via
+   `tests/cellpose_flowqc.mjs` (0/72000 pixels differ, both fixtures) and
+   `tests/cellpose_forward.mjs` (AP@0.5=1.000 unchanged). `src/profile/cost.js`'s
+   flowdiff/flowgrad cost model was updated to use the packed count instead of H*W, so
+   profiling numbers for this step don't quietly go stale.
+2. ~~Re-test f16~~ **Done, on the one fixture available.** `tests/cellpose_f16.mjs` builds
+   the same storage-only f16 shared-memory transform as `regblk_2x2_f16` in
+   `src/profile/conv-variants.js`, but applied to the kernel that actually ships
+   (`src/conv-kernel.js`'s BLK=16/2×2/CB=4, not the pre-Phase-1c variant that benchmark file
+   is built from), and holds it to IoU/cell-count agreement against the PyTorch reference
+   instead of a per-conv tolerance. Result: AP@0.5=1.000, pixelIoU=1.0000, exact mask-count
+   match on both `cellpose_img_075` fixtures, despite forward-tensor error up to 5.93e-2
+   (much larger than the ~2.8e-4 PHASE1.md measured on one conv — expected, since this
+   compounds f16 rounding across every conv layer in the network). **Caveat that matters:**
+   only one reference image exists in this repo. This is evidence f16 doesn't move the
+   final segmentation on the one case tested, not evidence it's safe in general — the
+   "real image set" docs/PHASE1.md asked for still doesn't exist here. Not switched into
+   production; that's a decision for whoever has more fixtures to test against.
+3. **`subgroup-matrix` — prototyped, not landed.** See `docs/PHASE2.md` for the full
+   writeup. Short version: the WGSL syntax for `chromium-experimental-subgroup-matrix` had
+   to be reverse-engineered from Tint's own compiler diagnostics (not documented anywhere
+   findable, and still actively changing upstream as of the 2026-03-24 WGSL meeting).
+   `demo/subgroup_matrix_gemm.html` is a correctness-checked GEMM microkernel
+   (`C[Cout,HW] = A[Cout,Cin] @ B[Cin,HW]`, the exact shape a K=1 conv already uses) —
+   maxRel 5.73e-7 against a CPU reference, ~650 GFLOP/s / ~21% of roof with **zero**
+   shared-memory staging, against the shipping kernel's 1227 GFLOP/s / 40%. That headroom
+   is real but this is not a conv replacement yet: no im2col for K=3 (95% of conv time,
+   and the actual hard part), no shared-memory staging, no BN/relu/residual fusion, no
+   handling for non-multiple-of-8 shapes. docs/PHASE2.md has the ordered next steps.
 4. **Mask assembly after the flow QC** — seed growth and label assignment — is the next
    CPU item once the above shrink around it.
 5. **Re-measure StarDist and InstanSeg.** Their conv shapes were never profiled — the

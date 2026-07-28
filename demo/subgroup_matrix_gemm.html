@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>subgroup_matrix GEMM probe — Phase 2</title>
+<style>
+  :root { color-scheme: light dark; --bg:#0f1115; --panel:#171a21; --fg:#e6e8ec; --mut:#9aa4b2; --line:#262b36; --ok:#3fb950; --bad:#f85149; }
+  body { margin:0; font:14px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:20px 24px; border-bottom:1px solid var(--line); }
+  main { padding:20px 24px 60px; max-width:900px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.mut { color:var(--mut); margin:4px 0; }
+  pre { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; white-space:pre-wrap; }
+</style></head>
+<body>
+<header>
+  <h1>subgroup_matrix GEMM probe <span class="mut">— Phase 2, item 1</span></h1>
+  <p class="mut">Validates the chromium-experimental-subgroup-matrix WGSL API on this adapter and
+  runs a correctness-checked GEMM against a CPU reference. Chrome only — see docs/PHASE2.md.
+  <a href="index.html">← demos</a></p>
+</header>
+<main>
+<pre id="out">running…</pre>
+</main>
+<script>
+const el = document.getElementById("out");
+const log = (s) => { el.textContent += s + "\n"; };
+el.textContent = "";
+
+// A single 8x8 matmul first, against an identity matrix, to pin down the calling
+// convention before trusting a larger test — see docs/PHASE2.md for how this syntax
+// was actually found (Tint's own overload-resolution diagnostics, not documentation).
+const IDENTITY_WGSL = `
+enable chromium_experimental_subgroup_matrix;
+@group(0) @binding(0) var<storage, read> A: array<f32>;
+@group(0) @binding(1) var<storage, read> B: array<f32>;
+@group(0) @binding(2) var<storage, read_write> C: array<f32>;
+@compute @workgroup_size(32)
+fn main() {
+  let a = subgroupMatrixLoad<subgroup_matrix_left<f32, 8, 8>>(&A, 0u, false, 8u);
+  let b = subgroupMatrixLoad<subgroup_matrix_right<f32, 8, 8>>(&B, 0u, false, 8u);
+  let c = subgroupMatrixMultiply<f32>(a, b);
+  subgroupMatrixStore(&C, 0u, c, false, 8u);
+}`;
+
+// A real-shape GEMM: A = weights [Cout,Cin] row-major, B = input [Cin,HW] row-major,
+// C = output [Cout,HW] row-major — exactly the layout a K=1 (pointwise) conv already
+// uses, so this needs no im2col. One workgroup = one simdgroup (32 lanes) = one 8x8
+// output tile, looping over Cin in 8-wide chunks. No shared-memory staging yet — tiles
+// load straight out of the storage buffers, which subgroupMatrixLoad supports directly.
+const GEMM_WGSL = `
+enable chromium_experimental_subgroup_matrix;
+struct P { Cout:u32, Cin:u32, HW:u32, _p:u32 };
+@group(0) @binding(0) var<uniform> p: P;
+@group(0) @binding(1) var<storage,read>       A: array<f32>;
+@group(0) @binding(2) var<storage,read>       B: array<f32>;
+@group(0) @binding(3) var<storage,read_write> C: array<f32>;
+
+@compute @workgroup_size(32)
+fn main(@builtin(workgroup_id) wg: vec3<u32>) {
+  let coBase = wg.x * 8u;
+  let nBase  = wg.y * 8u;
+  var acc = subgroup_matrix_result<f32, 8, 8>();
+  var ci = 0u;
+  loop {
+    if (ci >= p.Cin) { break; }
+    let a = subgroupMatrixLoad<subgroup_matrix_left<f32, 8, 8>>(&A, coBase * p.Cin + ci, false, p.Cin);
+    let b = subgroupMatrixLoad<subgroup_matrix_right<f32, 8, 8>>(&B, ci * p.HW + nBase, false, p.HW);
+    acc = subgroupMatrixMultiplyAccumulate(a, b, acc);
+    ci = ci + 8u;
+  }
+  subgroupMatrixStore(&C, coBase * p.HW + nBase, acc, false, p.HW);
+}`;
+
+function mulberry32(seed) {
+  return () => { seed |= 0; seed = (seed + 0x6D2B79F5) | 0;
+    let t = Math.imul(seed ^ (seed >>> 15), 1 | seed);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+}
+
+(async () => {
+  try {
+    if (!navigator.gpu) { log("NO_GPU — Chrome/Edge with WebGPU required."); return; }
+    const adapter = await navigator.gpu.requestAdapter();
+    const feats = ["chromium-experimental-subgroup-matrix", "subgroups"].filter(f => adapter.features.has(f));
+    log("adapter features requested: " + feats.join(", "));
+    if (!feats.includes("chromium-experimental-subgroup-matrix")) {
+      log("chromium-experimental-subgroup-matrix not available on this adapter — nothing further to test here.");
+      return;
+    }
+    const device = await adapter.requestDevice({ requiredFeatures: feats });
+    device.addEventListener("uncapturederror", (e) => log("UNCAPTURED: " + e.error.message));
+
+    log("\n=== 8x8 identity sanity check ===");
+    {
+      const mod = device.createShaderModule({ code: IDENTITY_WGSL });
+      const info = await mod.getCompilationInfo();
+      for (const m of info.messages) log(`[${m.type}] ${m.lineNum}:${m.linePos} ${m.message}`);
+      const pipe = device.createComputePipeline({ layout: "auto", compute: { module: mod, entryPoint: "main" } });
+      const N = 64;
+      const Adata = new Float32Array(N); for (let i = 0; i < N; i++) Adata[i] = i + 1;
+      const Bdata = new Float32Array(N); for (let i = 0; i < 8; i++) Bdata[i * 8 + i] = 1;
+      const mk = (data, usage) => { const b = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true }); new Float32Array(b.getMappedRange()).set(data); b.unmap(); return b; };
+      const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+      const Abuf = mk(Adata, S), Bbuf = mk(Bdata, S), Cbuf = device.createBuffer({ size: N * 4, usage: S });
+      const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: Abuf } }, { binding: 1, resource: { buffer: Bbuf } }, { binding: 2, resource: { buffer: Cbuf } }] });
+      const enc = device.createCommandEncoder();
+      const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(1); pass.end();
+      const rb = device.createBuffer({ size: N * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      enc.copyBufferToBuffer(Cbuf, 0, rb, 0, N * 4);
+      device.queue.submit([enc.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const out = new Float32Array(rb.getMappedRange().slice(0));
+      rb.unmap();
+      let ok = true; for (let i = 0; i < N; i++) if (Math.abs(out[i] - Adata[i]) > 1e-4) ok = false;
+      log("A * I == A: " + ok);
+    }
+
+    log("\n=== real-shape GEMM vs CPU reference ===");
+    {
+      const mod = device.createShaderModule({ code: GEMM_WGSL });
+      const pipe = device.createComputePipeline({ layout: "auto", compute: { module: mod, entryPoint: "main" } });
+      const Cout = 256, Cin = 256, H = 128, W = 64, HW = H * W;
+      const rnd = mulberry32(12345);
+      const Adata = new Float32Array(Cout * Cin).map(() => rnd() * 2 - 1);
+      const Bdata = new Float32Array(Cin * HW).map(() => rnd() * 2 - 1);
+      log(`shapes: A[${Cout}x${Cin}] B[${Cin}x${HW}] C[${Cout}x${HW}]  (~${(2 * Cout * Cin * HW / 1e9).toFixed(3)} GFLOP/dispatch)`);
+
+      const mk = (data, usage) => { const b = device.createBuffer({ size: data.byteLength, usage, mappedAtCreation: true }); new Float32Array(b.getMappedRange()).set(data); b.unmap(); return b; };
+      const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+      const Abuf = mk(Adata, S), Bbuf = mk(Bdata, S), Cbuf = device.createBuffer({ size: Cout * HW * 4, usage: S });
+      const uni = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      device.queue.writeBuffer(uni, 0, new Uint32Array([Cout, Cin, HW, 0]));
+      const bg = device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: uni } }, { binding: 1, resource: { buffer: Abuf } },
+        { binding: 2, resource: { buffer: Bbuf } }, { binding: 3, resource: { buffer: Cbuf } }] });
+      const gx = Cout / 8, gy = HW / 8;
+
+      const N = 20;
+      for (let i = 0; i < 3; i++) {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(gx, gy); pass.end();
+        device.queue.submit([enc.finish()]);
+      }
+      await device.queue.onSubmittedWorkDone();
+      const t0 = performance.now();
+      for (let i = 0; i < N; i++) {
+        const enc = device.createCommandEncoder();
+        const pass = enc.beginComputePass(); pass.setPipeline(pipe); pass.setBindGroup(0, bg); pass.dispatchWorkgroups(gx, gy); pass.end();
+        device.queue.submit([enc.finish()]);
+      }
+      await device.queue.onSubmittedWorkDone();
+      const gpuMs = (performance.now() - t0) / N;
+
+      const rb = device.createBuffer({ size: Cout * HW * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+      const enc2 = device.createCommandEncoder();
+      enc2.copyBufferToBuffer(Cbuf, 0, rb, 0, Cout * HW * 4);
+      device.queue.submit([enc2.finish()]);
+      await rb.mapAsync(GPUMapMode.READ);
+      const out = new Float32Array(rb.getMappedRange().slice(0));
+      rb.unmap();
+
+      const refAt = (co, n) => { let s = 0; for (let ci = 0; ci < Cin; ci++) s += Adata[co * Cin + ci] * Bdata[ci * HW + n]; return s; };
+      let maxRel = 0;
+      const checks = [[0, 0], [0, 1], [1, 0], [255, 0], [0, HW - 1], [255, HW - 1], [128, 8192], [37, 4096], [200, 100]];
+      for (const [co, n] of checks) { const rel = Math.abs(out[co * HW + n] - refAt(co, n)) / (Math.abs(refAt(co, n)) + 1e-8); if (rel > maxRel) maxRel = rel; }
+      log(`checked ${checks.length} entries against a CPU reference, maxRel=${maxRel.toExponential(2)}`);
+      log(`${gpuMs.toFixed(3)} ms/dispatch, ${(2 * Cout * Cin * HW / 1e9 / (gpuMs / 1000)).toFixed(0)} GFLOP/s, no shared-memory staging`);
+      log(maxRel < 1e-4 ? "CORRECT" : "MISMATCH");
+    }
+    log("\nDONE");
+  } catch (e) {
+    log("ERR " + e.message + "\n" + (e.stack || ""));
+  }
+})();
+</script>
+</body></html>

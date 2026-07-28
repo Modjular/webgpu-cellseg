@@ -145,14 +145,22 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_id) li: 
 // Each mask runs its own iteration count (2*(ly+lx)), so masks freeze individually once
 // they reach it and the dispatch loop runs to the maximum. Freezing is per label and
 // neighbours are same-label by construction, so no mask ever reads a half-frozen one.
+//
+// Dispatch is over `idx`, the packed list of pixels belonging to a kept mask, not the
+// whole image — background and rejected-mask pixels never contribute heat (niter=0 or
+// label mismatch means their Tout would only ever read back as the zero the buffer
+// already starts at), so skipping them changes nothing about the result, only how much
+// of the image is visited per iteration. This is what let the nuclear channel's small,
+// sparse masks catch up to the cyto channel's speedup (docs/PHASE1.md item 3).
 const FLOWDIFF_WGSL = /* wgsl */`
-struct P { H:u32, W:u32, t:i32, _p:u32 };
+struct P { H:u32, W:u32, t:i32, count:u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage,read>       labels: array<i32>;
 @group(0) @binding(2) var<storage,read>       niter:  array<i32>;
 @group(0) @binding(3) var<storage,read>       med:    array<i32>;
 @group(0) @binding(4) var<storage,read>       Tin:    array<f32>;
 @group(0) @binding(5) var<storage,read_write> Tout:   array<f32>;
+@group(0) @binding(6) var<storage,read>       idx:    array<i32>;
 
 fn samp(x: i32, y: i32, l: i32, m: i32) -> f32 {
   if (x < 0 || x >= i32(p.W) || y < 0 || y >= i32(p.H)) { return 0.0; }
@@ -163,14 +171,13 @@ fn samp(x: i32, y: i32, l: i32, m: i32) -> f32 {
   return v;
 }
 
-@compute @workgroup_size(16,16,1)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= p.W || gid.y >= p.H) { return; }
-  let i = i32(gid.y * p.W + gid.x);
+  if (gid.x >= p.count) { return; }
+  let i = idx[gid.x];
   let l = labels[i];
-  if (l <= 0) { Tout[i] = 0.0; return; }
   if (p.t >= niter[l]) { Tout[i] = Tin[i]; return; }
-  let x = i32(gid.x); let y = i32(gid.y);
+  let x = i % i32(p.W); let y = i / i32(p.W);
   let m = med[l];
   // Summation order matches the CPU implementation tap for tap.
   let s = samp(x, y, l, m)
@@ -184,13 +191,17 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 // Central difference of the diffused field, label-masked for the same reason as above.
 // Normalisation and the per-mask error stay on the CPU in f64: they are O(HW) and cheap,
 // and keeping them in double means the threshold comparison that decides how many masks
-// survive is not made on f32 sums.
+// survive is not made on f32 sums. Dispatch is over the same packed `idx` as the
+// diffusion — every other pixel's gradient is read from the buffer's zero-initialised
+// default, which is what the CPU-side loop already treats it as (it skips l===0 and
+// !keep[l] unconditionally).
 const FLOWGRAD_WGSL = /* wgsl */`
-struct P { H:u32, W:u32, t:i32, _p:u32 };
+struct P { H:u32, W:u32, t:i32, count:u32 };
 @group(0) @binding(0) var<uniform> p: P;
 @group(0) @binding(1) var<storage,read>       labels: array<i32>;
 @group(0) @binding(4) var<storage,read>       T:      array<f32>;
 @group(0) @binding(5) var<storage,read_write> grad:   array<f32>;
+@group(0) @binding(6) var<storage,read>       idx:    array<i32>;
 
 fn g(x: i32, y: i32, l: i32) -> f32 {
   if (x < 0 || x >= i32(p.W) || y < 0 || y >= i32(p.H)) { return 0.0; }
@@ -199,14 +210,13 @@ fn g(x: i32, y: i32, l: i32) -> f32 {
   return T[n];
 }
 
-@compute @workgroup_size(16,16,1)
+@compute @workgroup_size(256)
 fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
-  if (gid.x >= p.W || gid.y >= p.H) { return; }
-  let i = i32(gid.y * p.W + gid.x);
+  if (gid.x >= p.count) { return; }
+  let i = idx[gid.x];
   let HW = i32(p.H * p.W);
   let l = labels[i];
-  if (l <= 0) { grad[i] = 0.0; grad[HW + i] = 0.0; return; }
-  let x = i32(gid.x); let y = i32(gid.y);
+  let x = i % i32(p.W); let y = i / i32(p.W);
   grad[i]      = g(x, y + 1, l) - g(x, y - 1, l);
   grad[HW + i] = g(x + 1, y, l) - g(x - 1, y, l);
 }`;
@@ -282,6 +292,7 @@ export class CellposeWebGPU {
         { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+        { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     });
     const flowPl = d.createPipelineLayout({ bindGroupLayouts: [this._flowLayout] });
@@ -1004,6 +1015,16 @@ export class CellposeWebGPU {
     }
     if (maxNiter === 0) return new Float64Array(maxLabel + 1);
 
+    // Packed list of pixels belonging to a kept mask — the diffusion and gradient passes
+    // dispatch over this instead of the whole image (see FLOWDIFF_WGSL above). Background
+    // and rejected-mask pixels are never members, so they never run: their `grad`/`Tout`
+    // stay at the buffers' zero-initialised default, which is exactly what every reader
+    // of those pixels already treats them as.
+    let totalKept = 0;
+    for (let l = 1; l <= maxLabel; l++) if (keep[l]) totalKept += cnt[l];
+    const idx = new Int32Array(totalKept);
+    for (let i = 0, k = 0; i < HW; i++) { const l = labels[i]; if (l > 0 && keep[l]) idx[k++] = i; }
+
     const S = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
     const labBuf = d.createBuffer({ size: HW * 4, usage: S });
     const nitBuf = d.createBuffer({ size: Math.max(256, (maxLabel + 1) * 4), usage: S });
@@ -1011,19 +1032,21 @@ export class CellposeWebGPU {
     const T0 = d.createBuffer({ size: HW * 4, usage: S });
     const T1 = d.createBuffer({ size: HW * 4, usage: S });
     const gradBuf = d.createBuffer({ size: 2 * HW * 4, usage: S });
+    const idxBuf = d.createBuffer({ size: Math.max(256, totalKept * 4), usage: S });
     d.queue.writeBuffer(labBuf, 0, labels instanceof Int32Array ? labels : new Int32Array(labels));
     d.queue.writeBuffer(nitBuf, 0, niter);
     d.queue.writeBuffer(medBuf, 0, med);
     d.queue.writeBuffer(T0, 0, new Float32Array(HW));
+    d.queue.writeBuffer(idxBuf, 0, idx);
 
     // One uniform buffer holding every iteration's `t`, addressed by dynamic offset.
     const align = d.limits.minUniformBufferOffsetAlignment || 256;
     const uni = d.createBuffer({
       size: align * maxNiter, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    const slot = new Uint32Array(align / 4);   // struct P { H:u32, W:u32, t:i32, _p:u32 }
+    const slot = new Uint32Array(align / 4);   // struct P { H:u32, W:u32, t:i32, count:u32 }
     for (let t = 0; t < maxNiter; t++) {
-      slot[0] = H; slot[1] = W; slot[2] = t; slot[3] = 0;
+      slot[0] = H; slot[1] = W; slot[2] = t; slot[3] = totalKept;
       d.queue.writeBuffer(uni, t * align, slot);
     }
 
@@ -1035,25 +1058,26 @@ export class CellposeWebGPU {
         { binding: 3, resource: { buffer: medBuf } },
         { binding: 4, resource: { buffer: Tin } },
         { binding: 5, resource: { buffer: Tout } },
+        { binding: 6, resource: { buffer: idxBuf } },
       ],
     });
     const bgA = bg(T0, T1), bgB = bg(T1, T0);
-    const gx = Math.ceil(W / 16), gy = Math.ceil(H / 16);
+    const nwg = Math.ceil(totalKept / 256);
 
     const enc = this._mkEncoder("flowqc");
     for (let t = 0; t < maxNiter; t++) {
-      const pass = enc.beginComputePass({ label: `flowdiff|${H}x${W}|t${t}` });
+      const pass = enc.beginComputePass({ label: `flowdiff|${H}x${W}|t${t}|n${totalKept}` });
       pass.setPipeline(this.pFlowDiff);
       pass.setBindGroup(0, t % 2 === 0 ? bgA : bgB, [t * align]);
-      pass.dispatchWorkgroups(gx, gy); pass.end();
+      pass.dispatchWorkgroups(nwg); pass.end();
     }
     // Iteration t writes T1 for even t, T0 for odd — so the last write lands in T1 when
     // maxNiter is odd and T0 when it is even.
     const finalT = (maxNiter % 2 === 1) ? T1 : T0;
-    const gpass = enc.beginComputePass({ label: `flowgrad|${H}x${W}|n${maxNiter}` });
+    const gpass = enc.beginComputePass({ label: `flowgrad|${H}x${W}|it${maxNiter}|n${totalKept}` });
     gpass.setPipeline(this.pFlowGrad);
     gpass.setBindGroup(0, bg(finalT, gradBuf), [0]);
-    gpass.dispatchWorkgroups(gx, gy); gpass.end();
+    gpass.dispatchWorkgroups(nwg); gpass.end();
 
     const rb = d.createBuffer({ size: 2 * HW * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
     enc.copyBufferToBuffer(gradBuf, 0, rb, 0, 2 * HW * 4);
@@ -1061,7 +1085,7 @@ export class CellposeWebGPU {
     await rb.mapAsync(GPUMapMode.READ);
     const grad = new Float32Array(rb.getMappedRange().slice(0));
     rb.unmap();
-    for (const b of [labBuf, nitBuf, medBuf, T0, T1, gradBuf, uni, rb]) b.destroy();
+    for (const b of [labBuf, nitBuf, medBuf, T0, T1, gradBuf, idxBuf, uni, rb]) b.destroy();
 
     // Unit-normalise per pixel and accumulate the per-mask error, both in f64 to match
     // the CPU path exactly at the point where the threshold is applied.
