@@ -1,0 +1,8 @@
+{
+ "name": "02",
+ "H": 256,
+ "W": 256,
+ "threshold": 0.5,
+ "min_distance": 1,
+ "n_spots": 417
+}
