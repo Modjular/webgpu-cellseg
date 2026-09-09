@@ -1,0 +1,18 @@
+{
+ "name": "he_histo",
+ "H": 256,
+ "W": 256,
+ "Hp": 256,
+ "Wp": 256,
+ "gh": 128,
+ "gw": 128,
+ "grid": [
+  2,
+  2
+ ],
+ "n_rays": 32,
+ "channels": 3,
+ "prob_thresh": 0.6924782541382084,
+ "nms_thresh": 0.3,
+ "n_instances": 79
+}
