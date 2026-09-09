@@ -1,0 +1,18 @@
+# Dev-only deps for regenerating the StarDist reference dumps against the ORIGINAL
+# TensorFlow/Keras model — the `.venv-stardist` environment. Kept separate from the
+# PyTorch-based exporters (cellpose, instanseg) because TensorFlow and Torch pin
+# conflicting numpy/protobuf versions; never install them in one venv.
+#
+#   python3 -m venv tools/.venv-stardist
+#   tools/.venv-stardist/bin/pip install -r tools/requirements-stardist.txt
+#
+# Runs on CPU — used by export_stardist.py (2D_versatile_fluo) and
+# export_stardist_he_ref.py (2D_versatile_he). Versions below are the set this was
+# last generated and self-checked with (numpy<2 is required: TF 2.21 / numba reject
+# numpy 2.x).
+tensorflow-cpu==2.21.0
+stardist==0.9.2
+csbdeep==0.8.2
+imageio==2.37.4        # loads StarDist's shipped H&E example (test_image_he_2d)
+tifffile==2026.3.3
+numpy==1.26.4

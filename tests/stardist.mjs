@@ -5,7 +5,7 @@
 // The reference prob/dist come from Keras on the same padded input; the reference
 // labels come from StarDist's own C-NMS on that same prob/dist (see
 // export_stardist.py), so this isolates the WGSL forward and the JS NMS/geometry.
-import { StarDistWebGPU, normalize99, padTo16 } from "../src/stardist.js";
+import { StarDistWebGPU, normalize99, padTo16, padChannelsTo16 } from "../src/stardist.js";
 const D = (p) => new URL(p, import.meta.url);   // resolve data relative to this file
 
 function readF32(path) {
@@ -51,23 +51,43 @@ const names = Deno.args.length ? Deno.args
   : [...Deno.readDirSync(D("refdata/stardist"))].filter(e => e.name.startsWith("sd_") && e.name.endsWith(".meta.json"))
       .map(e => e.name.replace(".meta.json", "")).sort();
 
-const manifest = JSON.parse(Deno.readTextFileSync(D("../weights/stardist-fluo/manifest.json")));
-const binU8 = Deno.readFileSync(D("../weights/stardist-fluo/weights.bin"));
+// Which checkpoint a sample belongs to: sd_he_* is the RGB H&E model, everything
+// else the grayscale fluo one. Weights are (re)loaded on demand so one run can cover
+// both — samples are sorted, so each checkpoint loads at most once.
+const weightsDir = (name) => name.startsWith("sd_he") ? "stardist-he" : "stardist-fluo";
 const sd = await StarDistWebGPU.create();
-sd.loadWeights(manifest, binU8.buffer);
-console.log("loaded", Object.keys(manifest.tensors).length, "weight tensors\n");
+let loadedDir = null;
+function ensureWeights(dir) {
+  if (dir === loadedDir) return;
+  const manifest = JSON.parse(Deno.readTextFileSync(D(`../weights/${dir}/manifest.json`)));
+  const binU8 = Deno.readFileSync(D(`../weights/${dir}/weights.bin`));
+  sd.loadWeights(manifest, binU8.buffer);
+  loadedDir = dir;
+  console.log(`loaded ${Object.keys(manifest.tensors).length} weight tensors from ${dir}`);
+}
 
 let allOk = true;
 for (const name of names) {
   const meta = JSON.parse(Deno.readTextFileSync(D(`refdata/stardist/${name}.meta.json`)));
   const { H, W, Hp, Wp, gh, gw, n_rays, prob_thresh, nms_thresh } = meta;
-  const input = readF32(D(`refdata/stardist/${name}.input.bin`));      // normalized [H,W]
+  const input = readF32(D(`refdata/stardist/${name}.input.bin`));      // normalized [C,H,W]
   const refProb = readF32(D(`refdata/stardist/${name}.prob.bin`));     // [gh,gw]
   const refDist = readF32(D(`refdata/stardist/${name}.dist.bin`));     // [gh,gw,32]
   const refLabels = readI32(D(`refdata/stardist/${name}.labels.bin`)); // [H,W]
 
-  // preprocess: our reflect-pad of the (already normalized) reference input
-  const { data, Hp: myHp, Wp: myWp } = padTo16(input, H, W);
+  ensureWeights(weightsDir(name));
+
+  // preprocess: reflect-pad the (already normalized) reference input. Fluo is a single
+  // [H,W] plane; H&E is [C,H,W] — split into planes, pad each, and stack to [C,Hp,Wp].
+  const C = input.length / (H * W);
+  let data, myHp, myWp;
+  if (C === 1) {
+    ({ data, Hp: myHp, Wp: myWp } = padTo16(input, H, W));
+  } else {
+    const planes = [];
+    for (let c = 0; c < C; c++) planes.push(input.subarray(c * H * W, (c + 1) * H * W));
+    ({ data, Hp: myHp, Wp: myWp } = padChannelsTo16(planes, H, W));
+  }
   const preOk = myHp === Hp && myWp === Wp;
 
   const t0 = performance.now();
